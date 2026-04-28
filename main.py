@@ -8,12 +8,18 @@ from dotenv import load_dotenv
 # --- CONFIGURATION ---
 load_dotenv()  # Loads variables from the local .env file
 
-genai.configure(api_key = os.getenv("GENAI_API_KEY"))
+api_key = os.getenv("GENAI_API_KEY")
+if not api_key:
+    raise ValueError("CRITICAL ERROR: GENAI_API_KEY is missing! Please check your .env file.")
+
+genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-3-flash-preview')
 
-NICK = "ravoldt"
+NICK = os.getenv("TWITCH_USERNAME")
 PASS = os.getenv("TWITCH_TOKEN")
-CHANNEL = "#ravoldt"
+CHANNEL = os.getenv("CHANNEL")
+if CHANNEL and not CHANNEL.startswith("#"):
+    CHANNEL = f"#{CHANNEL}"
 
 # The Queue
 question_queue = []
