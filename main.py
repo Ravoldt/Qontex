@@ -3,7 +3,11 @@ import re
 import threading
 import google.generativeai as genai
 import os
+import time
+import json
 from dotenv import load_dotenv
+from utils import Message, get_streamer_name, create_stream_folder, log_message, log_json, log_start_stop, shared_deque
+import datetime
 
 # --- CONFIGURATION ---
 load_dotenv()  # Loads variables from the local .env file
@@ -20,6 +24,11 @@ PASS = os.getenv("TWITCH_TOKEN")
 CHANNEL = os.getenv("CHANNEL")
 if CHANNEL and not CHANNEL.startswith("#"):
     CHANNEL = f"#{CHANNEL}"
+
+streamer_name = CHANNEL.lstrip('#') if CHANNEL else "unknown"
+stream_start = datetime.datetime.now()
+log_folder = create_stream_folder(streamer_name, stream_start)
+log_start_stop(log_folder, "start")
 
 # The Queue
 question_queue = []
@@ -45,6 +54,46 @@ def ask_gemini(username, question):
     except Exception as e:
         print(f"\n❌ Gemini API Error: {e}\n")
 
+def process_items_with_gemini():
+    """Process the last 3 minutes of messages for collected items."""
+    messages = shared_deque.get_recent()
+    if not messages:
+        return
+    # Format as text
+    context = "\n".join(str(msg) for msg in messages)
+    prompt = f"""
+    Based on this 3-minute context of transcript and chat from a Hollow Knight Silksong stream, list any items the streamer has collected.
+    Compare against known Hollow Knight wiki items to remove hallucinations. Provide a list of confirmed collected items.
+    Context:
+    {context}
+    """
+    try:
+        response = model.generate_content(prompt)
+        items = response.text.strip()
+        print(f"\n📦 Collected items: {items}\n")
+        # Log to collected_items.json
+        with open(os.path.join(log_folder, "collected_items.json"), "a", encoding='utf-8') as f:
+            json.dump({"timestamp": datetime.datetime.now().isoformat(), "items": items}, f)
+            f.write('\n')
+        
+        # Cut video segment
+        recording_path = os.path.join(log_folder, "recording.mp4")
+        if os.path.exists(recording_path) and messages:
+            start_time = max(0, messages[0].timestamp)
+            duration = 180  # 3 minutes
+            output_path = os.path.join(log_folder, f"segment_{int(start_time)}.mp4")
+            from utils import cut_video_segment
+            cut_video_segment(recording_path, output_path, start_time, duration)
+            print(f"Video segment saved to {output_path}")
+    except Exception as e:
+        print(f"❌ Gemini item processing error: {e}")
+
+def item_processor():
+    """Background thread to process items every 30 seconds."""
+    while True:
+        time.sleep(30)
+        process_items_with_gemini()
+
 # --- BACKGROUND THREAD (Twitch Listener) ---
 def irc_listener():
     sock = socket.socket()
@@ -64,9 +113,17 @@ def irc_listener():
                 username = match.group(1)
                 chat_msg = match.group(2).strip()
                 
+                # Calculate timestamp relative to stream start
+                timestamp = (datetime.datetime.now() - stream_start).total_seconds()
+                msg = Message(timestamp, "chat", chat_msg, user=username)
+                
                 # DEBUG: Print every chat message to verify connection
-                print(f"\r[DEBUG CHAT] {username}: {chat_msg}")
+                print(f"\r{msg}")
                 print("Cmd (list, ask <#>, clear, quit)> ", end="", flush=True)
+
+                log_message(log_folder, "chat.log", msg)
+                log_json(log_folder, "merged.json", msg.to_dict())
+                shared_deque.add_message(msg)
 
                 if is_likely_question(chat_msg):
                     question_queue.append({"user": username, "msg": chat_msg})
@@ -83,6 +140,10 @@ if __name__ == "__main__":
     # Start the background listener
     listener_thread = threading.Thread(target=irc_listener, daemon=True)
     listener_thread.start()
+    
+    # Start item processor
+    processor_thread = threading.Thread(target=item_processor, daemon=True)
+    processor_thread.start()
     
     print(f"Connected to {CHANNEL}. Listening for questions in the background...")
     
@@ -111,5 +172,7 @@ if __name__ == "__main__":
             print("Queue cleared.\n")
             
         elif cmd == "quit":
+            uptime = (datetime.datetime.now() - stream_start).total_seconds()
+            log_start_stop(log_folder, "stop", uptime=uptime)
             print("Shutting down...")
             break
