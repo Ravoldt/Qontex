@@ -8,6 +8,7 @@ import json
 from dotenv import load_dotenv
 from utils import Message, get_streamer_name, create_stream_folder, log_message, log_json, log_start_stop, shared_deque
 import datetime
+import streamlink as my_streamlink
 
 # --- CONFIGURATION ---
 load_dotenv()  # Loads variables from the local .env file
@@ -29,6 +30,8 @@ streamer_name = CHANNEL.lstrip('#') if CHANNEL else "unknown"
 stream_start = datetime.datetime.now()
 log_folder = create_stream_folder(streamer_name, stream_start)
 log_start_stop(log_folder, "start")
+
+STREAM_START_TIME = None
 
 # The Queue
 question_queue = []
@@ -76,7 +79,9 @@ def process_items_with_gemini():
             json.dump({"timestamp": datetime.datetime.now().isoformat(), "items": items}, f)
             f.write('\n')
         
-        # Cut video segment
+        # We commented this out as recording.mp4 is no longer generated directly.
+        # Video frames are now kept in an in-memory buffer via cv2.
+        """
         recording_path = os.path.join(log_folder, "recording.mp4")
         if os.path.exists(recording_path) and messages:
             start_time = max(0, messages[0].timestamp)
@@ -85,6 +90,7 @@ def process_items_with_gemini():
             from utils import cut_video_segment
             cut_video_segment(recording_path, output_path, start_time, duration)
             print(f"Video segment saved to {output_path}")
+        """
     except Exception as e:
         print(f"❌ Gemini item processing error: {e}")
 
@@ -96,6 +102,7 @@ def item_processor():
 
 # --- BACKGROUND THREAD (Twitch Listener) ---
 def irc_listener():
+    global STREAM_START_TIME
     sock = socket.socket()
     sock.connect(("irc.chat.twitch.tv", 6667)) # Using 6667 for simplicity in this example
     sock.send(f"PASS {PASS}\r\n".encode("utf-8"))
@@ -114,8 +121,8 @@ def irc_listener():
                 chat_msg = match.group(2).strip()
                 
                 # Calculate timestamp relative to stream start
-                timestamp = (datetime.datetime.now() - stream_start).total_seconds()
-                msg = Message(timestamp, "chat", chat_msg, user=username)
+                msg_time = time.time() - STREAM_START_TIME
+                msg = Message(msg_time, "chat", chat_msg, user=username)
                 
                 # DEBUG: Print every chat message to verify connection
                 print(f"\r{msg}")
@@ -137,9 +144,20 @@ def irc_listener():
 
 # --- MAIN THREAD (Your CLI Interface) ---
 if __name__ == "__main__":
+    global STREAM_START_TIME
+    STREAM_START_TIME = time.time()
+    
+    # Expose the start time to the streamlink module so transcripts share exactly the same logic
+    my_streamlink.STREAM_START_TIME = STREAM_START_TIME
+    
     # Start the background listener
     listener_thread = threading.Thread(target=irc_listener, daemon=True)
     listener_thread.start()
+    
+    # Start the streamlink capture loop as a background thread
+    source_channel = CHANNEL.lstrip('#') if CHANNEL else "babylon340"
+    capture_thread = threading.Thread(target=my_streamlink.run_capture_loop, args=(source_channel, log_folder), daemon=True)
+    capture_thread.start()
     
     # Start item processor
     processor_thread = threading.Thread(target=item_processor, daemon=True)
@@ -172,7 +190,7 @@ if __name__ == "__main__":
             print("Queue cleared.\n")
             
         elif cmd == "quit":
-            uptime = (datetime.datetime.now() - stream_start).total_seconds()
+            uptime = time.time() - STREAM_START_TIME
             log_start_stop(log_folder, "stop", uptime=uptime)
             print("Shutting down...")
             break
