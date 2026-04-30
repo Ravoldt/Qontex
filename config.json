@@ -1,0 +1,6 @@
+{
+    
+    "CHANNEL": "streamer_name_or_local_file_path",
+    "TWITCH_USERNAME": "your_twitch_username",
+    "PROCESS_FAST": false
+}

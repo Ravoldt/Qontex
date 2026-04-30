@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from collections import deque
 import threading
 
+_log_lock = threading.Lock()
+
 class Message:
     def __init__(self, timestamp, msg_type, text, user=None, **kwargs):
         self.timestamp = timestamp  # float seconds
@@ -48,26 +50,42 @@ def get_streamer_name(source):
         return source  # assume it's the name
 
 def create_stream_folder(streamer_name, start_time=None):
-    """Create and return path to logs/streamer_name/start_datetime/"""
+    """Create and return path to logs/streamer_name/YYYY-MM-DD/."""
     if start_time is None:
         start_time = datetime.now()
-    start_str = start_time.strftime("%Y-%m-%d_%H-%M-%S")
-    path = os.path.join("logs", streamer_name, start_str)
+    date_str = start_time.strftime("%Y-%m-%d")
+    path = os.path.join("logs", streamer_name, date_str)
     os.makedirs(path, exist_ok=True)
     return path
 
 def log_message(folder, filename, message, mode='a'):
     """Append message to file in folder."""
     path = os.path.join(folder, filename)
-    with open(path, mode, encoding='utf-8') as f:
-        f.write(str(message) + '\n')
+    with _log_lock:
+        with open(path, mode, encoding='utf-8') as f:
+            f.write(str(message) + '\n')
 
 def log_json(folder, filename, data, mode='a'):
     """Append data to JSON file (for merged timeline, list of dicts)."""
     path = os.path.join(folder, filename)
-    with open(path, mode, encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False)
-        f.write('\n')
+    with _log_lock:
+        with open(path, mode, encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.write('\n')
+
+def is_likely_question(message):
+    """Return True when a chat or transcript message looks like a question."""
+    message = message.lower().strip()
+    if message.endswith("?"):
+        return True
+    question_starters = [
+        "who", "what", "where", "when", "why", "how", "can you", "is there",
+        "do you", "does it", "are there", "could you", "would you", "should i",
+        "will it", "can i", "should we", "is this", "is that", "did he",
+        "did she", "did they", "does this", "does that", "i'm curious",
+        "anyone know", "does anyone"
+    ]
+    return any(message.startswith(q) for q in question_starters)
 
 def log_start_stop(folder, action, uptime=None):
     """Log start or stop with datetime and optional uptime."""

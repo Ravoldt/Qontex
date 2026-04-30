@@ -6,8 +6,9 @@ import cv2
 import threading
 from collections import deque
 from faster_whisper import WhisperModel
-from utils import Message, get_streamer_name, create_stream_folder, log_message, log_json, log_start_stop, shared_deque
+from utils import Message, create_stream_folder, get_streamer_name, is_likely_question, log_json, log_message, log_start_stop, shared_deque
 import datetime
+import json
 
 # Exported so it can be set by main.py
 STREAM_START_TIME = None
@@ -91,7 +92,7 @@ def capture_video_frames(source_url):
         
     cap.release()
 
-def run_capture_loop(source, log_folder, process_fast=False):
+def run_capture_loop(source, log_folder, process_fast=False, question_handler=None):
     """Main capture loop running as a background thread."""
     global STREAM_START_TIME
     
@@ -157,6 +158,8 @@ def run_capture_loop(source, log_folder, process_fast=False):
                             log_message(log_folder, "transcript.log", msg)
                             log_json(log_folder, "merged.json", msg.to_dict())
                             shared_deque.add_message(msg)
+                            if question_handler and is_likely_question(msg.text):
+                                threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
                         
                         # Reset the buffer for the next sentence
                         audio_buffer = []
@@ -170,14 +173,33 @@ def run_capture_loop(source, log_folder, process_fast=False):
             audio_process.wait()
 
 if __name__ == "__main__":
-    # Local execution fallback
+    from dotenv import load_dotenv
+    load_dotenv()
+    
     STREAM_START_TIME = time.time()
-    source = "https://www.twitch.tv/babylon340"
-    process_fast = False
+    try:
+        with open("config.json", "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print("CRITICAL ERROR: config.json is missing!")
+        exit(1)
+        
+    source = config.get("CHANNEL", "")
+    is_local_video = os.path.isfile(source)
+    
+    if not is_local_video and not source.startswith("http"):
+        source = source.lstrip('#')
+    
+    if not source:
+        print("Please set the CHANNEL in config.json!")
+        exit(1)
+        
+    process_fast = config.get("PROCESS_FAST", False)
 
     streamer_name = get_streamer_name(source)
     stream_start = datetime.datetime.now()
     log_folder = create_stream_folder(streamer_name, stream_start)
     log_start_stop(log_folder, "start")
     
+    print(f"Testing capture loop for {source}...")
     run_capture_loop(source, log_folder, process_fast=process_fast)
