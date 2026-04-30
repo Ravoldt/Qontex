@@ -1,6 +1,7 @@
 {
-    
-    "CHANNEL": "streamer_name_or_local_file_path",
-    "TWITCH_USERNAME": "your_twitch_username",
-    "PROCESS_FAST": false
+    "CHANNEL": "babylon340",
+    "TWITCH_USERNAME": "ravoldt",
+    "PROCESS_FAST": false,
+    "ENABLE_QA": true,
+    "ENABLE_ITEMS": false
 }

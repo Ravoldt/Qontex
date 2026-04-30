@@ -1,6 +1,8 @@
 import os
 import json
 import subprocess
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from collections import deque
 import threading
@@ -130,3 +132,62 @@ def cut_video_segment(input_path, output_path, start_time, duration):
         subprocess.run(command, check=True, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
         print("Error cutting video: {}".format(e))
+
+def refresh_twitch_token():
+    """Validate the current Twitch token and refresh it if expired."""
+    token = os.getenv("TWITCH_TOKEN")
+    client_id = os.getenv("TWITCH_CLIENT_ID")
+    client_secret = os.getenv("TWITCH_CLIENT_SECRET")
+    refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
+
+    clean_token = token.replace("oauth:", "") if token else ""
+
+    if clean_token:
+        req = urllib.request.Request("https://id.twitch.tv/oauth2/validate")
+        req.add_header("Authorization", f"OAuth {clean_token}")
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.getcode() == 200:
+                    return token
+        except urllib.error.HTTPError:
+            pass  # Token is invalid, proceed to refresh
+
+    if not all([client_id, client_secret, refresh_token]):
+        print("[!] Twitch token may be expired. Add TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_REFRESH_TOKEN to .env to enable auto-refresh.")
+        return token
+
+    print("[*] Twitch token expired. Attempting to refresh...")
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": "chat:read"
+    }).encode("utf-8")
+
+    req = urllib.request.Request("https://id.twitch.tv/oauth2/token", data=data)
+    try:
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            new_access_token = result.get("access_token")
+            new_refresh_token = result.get("refresh_token")
+
+            if new_access_token:
+                try:
+                    from dotenv import set_key
+                    env_path = os.path.join(os.getcwd(), ".env")
+                    set_key(env_path, "TWITCH_TOKEN", new_access_token)
+                    if new_refresh_token:
+                        set_key(env_path, "TWITCH_REFRESH_TOKEN", new_refresh_token)
+                except Exception as e:
+                    print(f"[!] Could not update .env automatically: {e}")
+
+                os.environ["TWITCH_TOKEN"] = new_access_token
+                if new_refresh_token:
+                    os.environ["TWITCH_REFRESH_TOKEN"] = new_refresh_token
+                print("[*] Twitch token successfully refreshed!")
+                return new_access_token
+    except Exception as e:
+        print(f"[!] Failed to refresh Twitch token: {e}")
+
+    return token

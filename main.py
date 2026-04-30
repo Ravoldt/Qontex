@@ -6,7 +6,7 @@ import datetime
 import argparse
 from dotenv import load_dotenv
 
-from utils import get_streamer_name, create_stream_folder, log_start_stop
+from utils import get_streamer_name, create_stream_folder, log_start_stop, refresh_twitch_token
 from twitch_chat import TwitchChatListener
 from gemini_agent import GeminiAgent
 import streamlink as my_streamlink
@@ -19,6 +19,7 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()
+    refresh_twitch_token()
     
     api_key = os.getenv("GENAI_API_KEY")
     if not api_key and not args.no_gemini:
@@ -35,6 +36,8 @@ def main():
     CHANNEL = config.get("CHANNEL")
     TWITCH_USERNAME = config.get("TWITCH_USERNAME")
     PROCESS_FAST = config.get("PROCESS_FAST", False)
+    ENABLE_QA = config.get("ENABLE_QA", True)
+    ENABLE_ITEMS = config.get("ENABLE_ITEMS", True)
 
     if not CHANNEL:
         print("Please set the CHANNEL in config.json!")
@@ -97,15 +100,20 @@ def main():
     agent = None
     if not args.no_gemini:
         agent = GeminiAgent(api_key, log_folder, start_time_ref=get_msg_time, game_name=GAME_NAME or source_channel)
-        def item_processor():
-            while True:
-                time.sleep(30)
-                agent.process_items(video_frames_deque=my_streamlink.video_frames)
-                
-        processor_thread = threading.Thread(target=item_processor, daemon=True)
-        processor_thread.start()
+        if ENABLE_ITEMS:
+            def item_processor():
+                while True:
+                    time.sleep(30)
+                    agent.process_items(video_frames_deque=my_streamlink.video_frames)
+                    
+            processor_thread = threading.Thread(target=item_processor, daemon=True)
+            processor_thread.start()
+        else:
+            print("Gemini Item Processing is DISABLED via config.json.")
     else:
         print("Gemini Agent is DISABLED (--no-gemini flag used).")
+
+    qa_handler = answer_question if (agent and ENABLE_QA) else None
 
     # 2. Start Chat Listener
     PASS = os.getenv("TWITCH_TOKEN")
@@ -117,7 +125,7 @@ def main():
             CHANNEL,
             log_folder,
             start_time_ref=get_msg_time,
-            question_handler=answer_question if agent else None,
+            question_handler=qa_handler,
             category_handler=update_stream_category,
         )
         listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
@@ -129,37 +137,24 @@ def main():
     # 3. Start Capture Loop
     capture_thread = threading.Thread(
         target=my_streamlink.run_capture_loop,
-        args=(source_channel, log_folder, PROCESS_FAST, answer_question if agent else None),
+        args=(source_channel, log_folder, PROCESS_FAST, qa_handler),
         daemon=True,
     )
     capture_thread.start()
 
     
     while True:
-        cmd = input("Cmd (list, ask <#>, clear, quit)> ").strip().lower()
+        cmd = input("Cmd (status, clear, quit)> ").strip().lower()
         
-        if cmd == "list":
-            print("\n--- Question Queue ---")
+        if cmd in ("status", "list"):
+            print("\n--- Status ---")
             if not chat_listener or not chat_listener.question_queue:
-                print("Queue is empty.")
+                print("Question queue is empty.")
             else:
+                print("Queued questions:")
                 for i, q in enumerate(chat_listener.question_queue):
                     print(f"[{i}] {q['user']}: {q['msg']}")
-            print("----------------------\n")
-            
-        elif cmd.startswith("ask "):
-            if not chat_listener:
-                print("Twitch chat disabled. Cannot ask queued questions.\n")
-                continue
-            try:
-                idx = int(cmd.split(" ")[1])
-                q = chat_listener.question_queue.pop(idx)
-                if agent:
-                    agent.ask_gemini(q['user'], q['msg'], source_type="chat", timestamp=q.get("timestamp"))
-                else:
-                    print(f"Gemini disabled: Mocking answer for {q['user']}: '{q['msg']}'\n")
-            except (IndexError, ValueError):
-                print("Invalid ID. Type 'list' to see IDs, then 'ask 0' for example.\n")
+            print("--------------\n")
                 
         elif cmd == "clear":
             if chat_listener:

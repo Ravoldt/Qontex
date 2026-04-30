@@ -5,7 +5,7 @@ import threading
 
 from twitchio.ext import commands
 
-from utils import Message, create_stream_folder, is_likely_question, log_json, log_message, shared_deque
+from utils import Message, create_stream_folder, is_likely_question, log_json, log_message, shared_deque, refresh_twitch_token
 
 
 class TwitchChatListener(commands.Bot):
@@ -68,7 +68,6 @@ class TwitchChatListener(commands.Bot):
         msg = Message(msg_time, "chat", chat_msg, user=username)
 
         print(f"\r{msg}")
-        print("Cmd (list, ask <#>, clear, quit)> ", end="", flush=True)
 
         log_message(self.log_folder, "chat.log", msg)
         log_json(self.log_folder, "merged.json", msg.to_dict())
@@ -77,7 +76,6 @@ class TwitchChatListener(commands.Bot):
         if self.is_likely_question(chat_msg):
             self.handle_question(msg)
             print(f"\r[!] New question detected! (Total in queue: {len(self.question_queue)})")
-            print("Cmd (list, ask <#>, clear, quit)> ", end="", flush=True)
 
         await self.handle_commands(message)
 
@@ -93,7 +91,6 @@ class TwitchChatListener(commands.Bot):
             if self.category_handler:
                 self.category_handler(category)
             print(f"\rTwitch category: {category}")
-            print("Cmd (list, ask <#>, clear, quit)> ", end="", flush=True)
         return category
 
     async def fetch_stream_category(self):
@@ -111,7 +108,6 @@ class TwitchChatListener(commands.Bot):
             return getattr(channel_info, "game_name", None)
         except Exception as e:
             print(f"\r[!] Twitch category lookup failed: {e}")
-            print("Cmd (list, ask <#>, clear, quit)> ", end="", flush=True)
         return None
 
 
@@ -121,6 +117,7 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     load_dotenv()
+    refresh_twitch_token()
     with open("config.json", "r") as f:
         config = json.load(f)
 
