@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qontex Dashboard</title>
+    <style>
+        /* Base Twitch-like Dark Theme */
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            background-color: #0e0e10;
+            color: #efeff1;
+            font-family: 'Inter', 'Roobert', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Layout Container */
+        .app-container {
+            display: flex;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Left Side: Video Player */
+        .video-container {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: #000;
+        }
+
+        #twitch-embed {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Right Side: Custom Chat */
+        .chat-container {
+            width: 340px;
+            min-width: 340px;
+            background-color: #18181b;
+            border-left: 1px solid #303032;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Chat Header & Filters */
+        .chat-header {
+            padding: 10px;
+            border-bottom: 1px solid #303032;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.5);
+            z-index: 10;
+        }
+
+        .chat-title {
+            font-weight: bold;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            text-align: center;
+        }
+
+        .filters {
+            display: flex;
+            gap: 5px;
+            justify-content: center;
+        }
+
+        .filter-btn {
+            background-color: #2f2f35;
+            color: #efeff1;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .filter-btn:hover { background-color: #3f3f46; }
+        .filter-btn.active { background-color: #9146ff; color: white; }
+
+        /* Chat Message Area */
+        .chat-messages {
+            flex-grow: 1;
+            padding: 10px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        /* Individual Message Styling */
+        .message-row {
+            font-size: 0.85rem;
+            line-height: 1.4;
+            padding: 4px 8px;
+            border-radius: 4px;
+            word-wrap: break-word;
+        }
+
+        .message-row:hover { background-color: #202024; }
+
+        /* Badges (Placeholder for your Palsona logic) */
+        .badge {
+            display: inline-block;
+            width: 18px;
+            height: 18px;
+            margin-right: 4px;
+            vertical-align: middle;
+            border-radius: 2px;
+        }
+
+        .username {
+            font-weight: bold;
+            margin-right: 4px;
+        }
+
+        /* Message Types */
+        .msg-chat .username { color: #ff8280; } /* Standard Twitch color */
+        
+        .msg-transcript { 
+            color: #adadb8; 
+            font-style: italic;
+        }
+        .msg-transcript .username { color: #adadb8; }
+
+        .msg-qontex {
+            background-color: rgba(145, 70, 255, 0.15);
+            border-left: 3px solid #9146ff;
+        }
+        .msg-qontex .username { color: #bf94ff; }
+
+        /* Scrollbar Styling */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #18181b; }
+        ::-webkit-scrollbar-thumb { background: #3a3a3d; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #4f4f52; }
+    </style>
+</head>
+<body>
+
+<div class="app-container">
+    <div class="video-container" id="twitch-embed"></div>
+
+    <div class="chat-container">
+        <div class="chat-header">
+            <div class="chat-title">Stream Chat & Qontex</div>
+            <div class="filters">
+                <button class="filter-btn active" onclick="toggleFilter('all')">All</button>
+                <button class="filter-btn" onclick="toggleFilter('chat')">Chat</button>
+                <button class="filter-btn" onclick="toggleFilter('transcript')">Transcript</button>
+                <button class="filter-btn" onclick="toggleFilter('qontex')">Qontex</button>
+            </div>
+        </div>
+        
+        <div class="chat-messages" id="chat-box">
+            <div class="message-row msg-chat" data-type="chat">
+                <span class="badge" style="background-color: red;" title="Broadcaster Badge Dummy"></span>
+                <span class="badge" style="background-color: blue;" title="Palsona Badge Dummy"></span>
+                <span class="username">Viewer123:</span>
+                <span class="message-text">This is a regular chat message! LULW</span>
+            </div>
+
+            <div class="message-row msg-transcript" data-type="transcript">
+                <span class="username">[TRANSCRIPT]:</span>
+                <span class="message-text">Okay, so let's head into the next room and see what we can find.</span>
+            </div>
+
+            <div class="message-row msg-qontex" data-type="qontex">
+                <span class="badge" style="background-color: #9146ff;" title="Bot Badge Dummy"></span>
+                <span class="username">Qontex:</span>
+                <span class="message-text">Viewer123 asked about the room. Based on the context, there are two Mosscreeps and a Pale Ore inside.</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://embed.twitch.tv/embed/v1.js"></script>
+<script>
+    // 1. Initialize the Twitch Player
+    // NOTE: If testing locally, 'localhost' MUST be in the parent array
+    new Twitch.Embed("twitch-embed", {
+        width: "100%",
+        height: "100%",
+        channel: "monstercat", // Replace with your target streamer
+        layout: "video",       // Video only, we are replacing their chat
+        autoplay: true,
+        parent: ["localhost", "127.0.0.1"] // Required by Twitch for security
+    });
+
+    // 2. Simple Filter Logic
+    function toggleFilter(filterType) {
+        // Update button UI
+        document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+        event.target.classList.add('active');
+
+        // Filter messages
+        const messages = document.querySelectorAll('.message-row');
+        messages.forEach(msg => {
+            if (filterType === 'all') {
+                msg.style.display = 'block';
+            } else {
+                msg.style.display = msg.getAttribute('data-type') === filterType ? 'block' : 'none';
+            }
+        });
+        scrollToBottom();
+    }
+
+    // 3. Auto-Scroll Logic
+    function scrollToBottom() {
+        const chatBox = document.getElementById('chat-box');
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    // 4. WebSocket Payload Example (Where you will connect your backend)
+    /*
+    const socket = new WebSocket('ws://localhost:8000/ws');
+    socket.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        // Use a library like @mkody/twitch-emoticons here to parse 'data.text' 
+        // into proper HTML tags for 7TV/FFZ before appending it.
+        
+        // Construct the new message div based on data.type ('chat', 'transcript', or 'qontex')
+        // Append to #chat-box
+        // Call scrollToBottom()
+    };
+    */
+</script>
+</body>
+</html>

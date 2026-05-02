@@ -18,6 +18,7 @@ class TwitchChatListener(commands.Bot):
         start_time_ref=None,
         question_handler=None,
         category_handler=None,
+        stream_start_handler=None,
     ):
         self.bot_nick = nick
         self.channel = channel.lstrip("#").lower()
@@ -25,6 +26,7 @@ class TwitchChatListener(commands.Bot):
         self.start_time_ref = start_time_ref
         self.question_handler = question_handler
         self.category_handler = category_handler
+        self.stream_start_handler = stream_start_handler
         self.question_queue = []
         self.stream_category = None
         self._event_loop = asyncio.new_event_loop()
@@ -52,8 +54,8 @@ class TwitchChatListener(commands.Bot):
 
     async def event_ready(self):
         print(f"TwitchIO connected as {self.bot_nick}. Joined #{self.channel}.")
-        await self.refresh_stream_category()
-        asyncio.create_task(self.refresh_stream_category_loop())
+        await self.refresh_stream_info()
+        asyncio.create_task(self.refresh_stream_info_loop())
 
     async def event_message(self, message):
         if getattr(message, "echo", False):
@@ -79,36 +81,39 @@ class TwitchChatListener(commands.Bot):
 
         await self.handle_commands(message)
 
-    async def refresh_stream_category_loop(self):
+    async def refresh_stream_info_loop(self):
         while True:
             await asyncio.sleep(300)
-            await self.refresh_stream_category()
+            await self.refresh_stream_info()
 
-    async def refresh_stream_category(self):
-        category = await self.fetch_stream_category()
+    async def refresh_stream_info(self):
+        category, started_at = await self.fetch_stream_info()
         if category and category != self.stream_category:
             self.stream_category = category
             if self.category_handler:
                 self.category_handler(category)
             print(f"\rTwitch category: {category}")
-        return category
+        
+        if started_at and self.stream_start_handler:
+            self.stream_start_handler(started_at.timestamp())
+        return category, started_at
 
-    async def fetch_stream_category(self):
+    async def fetch_stream_info(self):
         try:
             result = self.fetch_streams(user_logins=[self.channel])
             if hasattr(result, "__aiter__"):
                 async for stream in result:
-                    return getattr(stream, "game_name", None)
+                    return getattr(stream, "game_name", None), getattr(stream, "started_at", None)
             else:
                 streams = await result
                 if streams:
-                    return getattr(streams[0], "game_name", None)
+                    return getattr(streams[0], "game_name", None), getattr(streams[0], "started_at", None)
 
             channel_info = await self.fetch_channel(self.channel)
-            return getattr(channel_info, "game_name", None)
+            return getattr(channel_info, "game_name", None), None
         except Exception as e:
-            print(f"\r[!] Twitch category lookup failed: {e}")
-        return None
+            print(f"\r[!] Twitch stream info lookup failed: {e}")
+        return None, None
 
 
 if __name__ == "__main__":

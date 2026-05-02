@@ -61,6 +61,11 @@ def main():
     def get_msg_time():
         return time.time() - STREAM_START_TIME
 
+    def update_stream_start(ts):
+        nonlocal STREAM_START_TIME
+        STREAM_START_TIME = ts
+        my_streamlink.STREAM_START_TIME = ts
+
     def answer_question(msg):
         if agent:
             agent.ask_gemini(msg.user, msg.text, source_type=msg.type, timestamp=msg.timestamp)
@@ -83,6 +88,7 @@ def main():
             log_folder,
             start_time_ref=get_msg_time,
             category_handler=lambda category: print(f"Using Twitch category: {category}"),
+            stream_start_handler=update_stream_start,
         )
         listener.listen()
         return
@@ -127,6 +133,7 @@ def main():
             start_time_ref=get_msg_time,
             question_handler=qa_handler,
             category_handler=update_stream_category,
+            stream_start_handler=update_stream_start,
         )
         listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
         listener_thread.start()

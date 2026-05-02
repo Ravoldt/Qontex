@@ -1,7 +1,7 @@
 {
-    "CHANNEL": "babylon340",
-    "TWITCH_USERNAME": "ravoldt",
+    "CHANNEL": "streamername",
+    "TWITCH_USERNAME": "yourtwitchusername",
     "PROCESS_FAST": false,
-    "ENABLE_QA": true,
+    "ENABLE_QA": false,
     "ENABLE_ITEMS": false
 }

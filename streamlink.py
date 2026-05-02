@@ -5,6 +5,7 @@ import os
 import cv2
 import threading
 from collections import deque
+import torch
 from faster_whisper import WhisperModel
 from utils import Message, create_stream_folder, get_streamer_name, is_likely_question, log_json, log_message, log_start_stop, shared_deque
 import datetime
@@ -18,7 +19,6 @@ video_frames = deque(maxlen=180)
 
 def start_audio_capture(source, process_fast=False):
     """Starts a background process to extract audio from a video or livestream."""
-    # If source is just a username (no URL, no file extension), convert it to a Twitch URL
     if not source.startswith("http") and "." not in source:
         source = f"https://www.twitch.tv/{source}"
 
@@ -27,14 +27,12 @@ def start_audio_capture(source, process_fast=False):
     
     command = ["ffmpeg"]
     
-    # If it's a local file and we want real-time speed, use -re
     if not is_livestream and not process_fast:
         command.append("-re")
         
     if is_livestream:
         print(f"Resolving stream URL for {source}...")
         try:
-            # Ask streamlink for the direct HLS stream URL (audio_only)
             m3u8_url = subprocess.check_output(
                 ["streamlink", "--stream-url", source, "audio_only"],
                 stderr=subprocess.STDOUT
@@ -57,11 +55,10 @@ def start_audio_capture(source, process_fast=False):
     ])
     
     try:
-        # Launch the background process
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,     # Capture the audio stream
-            stderr=subprocess.DEVNULL   # Ignore streamlink's internal connection logs
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
         return process, m3u8_url
         
@@ -100,39 +97,53 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     model_size = "large-v3"
     model = WhisperModel(model_size, device="cuda", compute_type="float16") 
     
+    print("Loading Silero VAD model...")
+    # Load the highly accurate Silero VAD model directly from PyTorch Hub
+    vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, trust_repo=True)
+    vad_model.eval() # Ensure it's in evaluation mode
+    
     audio_process, m3u8_url = start_audio_capture(source, process_fast=process_fast)
     
     if audio_process:
-        # Start the video frame capture using cv2 in a background thread
         target_url = m3u8_url if m3u8_url else source
         video_thread = threading.Thread(target=capture_video_frames, args=(target_url,), daemon=True)
         video_thread.start()
         
-        print("Audio stream captured! Running VAD loop...")
+        print("Audio stream captured! Running AI-VAD loop...")
         
         try:                      
-            CHUNK_DURATION = 0.5  # Read 0.5 seconds of audio at a time
-            CHUNK_SIZE = int(16000 * 2 * CHUNK_DURATION) # 16kHz * 16-bit (2 bytes)
+            # Silero natively prefers exactly 32ms chunks (512 samples at 16kHz)
+            CHUNK_DURATION = 0.032  
+            CHUNK_SIZE = int(16000 * 2 * CHUNK_DURATION) 
             
-            SILENCE_THRESHOLD = 0.005  # Volume threshold (adjust if needed)
-            MAX_SILENCE_CHUNKS = 2     # How many silent chunks (1 sec) equal a pause?
+            SPEECH_THRESHOLD = 0.5     # AI Confidence: 50% probability it is human speech
+            MAX_SILENCE_CHUNKS = 30    # ~1.0 second of silence triggers the end of a sentence
+            MAX_CHUNK_LIMIT = 156      # ~5.0 seconds maximum chunk length (The Safety Valve)
             
             audio_buffer = []
             silence_counter = 0
             is_speaking = False
             
+            total_chunks = 0
+            audio_start_time = None
+            
             while True:
                 in_bytes = audio_process.stdout.read(CHUNK_SIZE)
                 if not in_bytes:
-                    break # Stream has ended
+                    break 
 
-                # Convert the raw bytes to a float32 numpy array normalized to [-1.0, 1.0]
+                if audio_start_time is None:
+                    audio_start_time = time.time()
+                    
+                total_chunks += 1
+
                 audio_data = np.frombuffer(in_bytes, np.int16).astype(np.float32) / 32768.0
                 
-                # Calculate the volume (mean absolute amplitude) of this chunk
-                volume = np.abs(audio_data).mean()
+                # Ask Silero if someone is speaking in this 32ms window
+                audio_tensor = torch.from_numpy(audio_data)
+                speech_prob = vad_model(audio_tensor, 16000).item()
                 
-                if volume > SILENCE_THRESHOLD:
+                if speech_prob > SPEECH_THRESHOLD:
                     is_speaking = True
                     silence_counter = 0
                     audio_buffer.append(audio_data)
@@ -140,18 +151,23 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                     silence_counter += 1
                     audio_buffer.append(audio_data)
                     
-                    if silence_counter >= MAX_SILENCE_CHUNKS:
-                        # We hit a pause. Combine chunks and transcribe!
+                    # Cut the chunk if we hit a 1-second pause OR if they have talked non-stop for 5 seconds
+                    if silence_counter >= MAX_SILENCE_CHUNKS or len(audio_buffer) >= MAX_CHUNK_LIMIT:
                         full_audio = np.concatenate(audio_buffer)
                         
-                        # vad_filter=True utilizes faster-whisper's built-in Silero VAD to clean internal dead air
-                        segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=True)
+                        # vad_filter=False because our Silero loop already perfectly trimmed the dead air!
+                        segments, _ = model.transcribe(full_audio, beam_size=15, vad_filter=False)
+                        
+                        chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
                         
                         for segment in segments:
-                            if STREAM_START_TIME is None:
-                                msg_time = time.time()
+                            if STREAM_START_TIME is None or process_fast:
+                                msg_time = chunk_base_time + segment.start
                             else:
-                                msg_time = time.time() - STREAM_START_TIME
+                                segment_wall_time = audio_start_time + chunk_base_time + segment.start
+                                msg_time = segment_wall_time - STREAM_START_TIME
+
+                            msg_time = max(0.0, msg_time)  
                                 
                             msg = Message(msg_time, "transcript", segment.text.strip(), user="streamer")
                             print(msg)
@@ -161,7 +177,6 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                             if question_handler and is_likely_question(msg.text):
                                 threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
                         
-                        # Reset the buffer for the next sentence
                         audio_buffer = []
                         is_speaking = False
                         silence_counter = 0
