@@ -4,144 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qontex Dashboard</title>
-    <style>
-        /* Base Twitch-like Dark Theme */
-        body, html {
-            margin: 0;
-            padding: 0;
-            height: 100vh;
-            background-color: #0e0e10;
-            color: #efeff1;
-            font-family: 'Inter', 'Roobert', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-            display: flex;
-            overflow: hidden;
-        }
-
-        /* Layout Container */
-        .app-container {
-            display: flex;
-            width: 100%;
-            height: 100%;
-        }
-
-        /* Left Side: Video Player */
-        .video-container {
-            flex-grow: 1;
-            display: flex;
-            flex-direction: column;
-            background-color: #000;
-        }
-
-        #twitch-embed {
-            width: 100%;
-            height: 100%;
-        }
-
-        /* Right Side: Custom Chat */
-        .chat-container {
-            width: 340px;
-            min-width: 340px;
-            background-color: #18181b;
-            border-left: 1px solid #303032;
-            display: flex;
-            flex-direction: column;
-        }
-
-        /* Chat Header & Filters */
-        .chat-header {
-            padding: 10px;
-            border-bottom: 1px solid #303032;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.5);
-            z-index: 10;
-        }
-
-        .chat-title {
-            font-weight: bold;
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            text-align: center;
-        }
-
-        .filters {
-            display: flex;
-            gap: 5px;
-            justify-content: center;
-        }
-
-        .filter-btn {
-            background-color: #2f2f35;
-            color: #efeff1;
-            border: none;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 0.8rem;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }
-
-        .filter-btn:hover { background-color: #3f3f46; }
-        .filter-btn.active { background-color: #9146ff; color: white; }
-
-        /* Chat Message Area */
-        .chat-messages {
-            flex-grow: 1;
-            padding: 10px;
-            overflow-y: auto;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-
-        /* Individual Message Styling */
-        .message-row {
-            font-size: 0.85rem;
-            line-height: 1.4;
-            padding: 4px 8px;
-            border-radius: 4px;
-            word-wrap: break-word;
-        }
-
-        .message-row:hover { background-color: #202024; }
-
-        /* Badges (Placeholder for your Palsona logic) */
-        .badge {
-            display: inline-block;
-            width: 18px;
-            height: 18px;
-            margin-right: 4px;
-            vertical-align: middle;
-            border-radius: 2px;
-        }
-
-        .username {
-            font-weight: bold;
-            margin-right: 4px;
-        }
-
-        /* Message Types */
-        .msg-chat .username { color: #ff8280; } /* Standard Twitch color */
-        
-        .msg-transcript { 
-            color: #adadb8; 
-            font-style: italic;
-        }
-        .msg-transcript .username { color: #adadb8; }
-
-        .msg-qontex {
-            background-color: rgba(145, 70, 255, 0.15);
-            border-left: 3px solid #9146ff;
-        }
-        .msg-qontex .username { color: #bf94ff; }
-
-        /* Scrollbar Styling */
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #18181b; }
-        ::-webkit-scrollbar-thumb { background: #3a3a3d; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #4f4f52; }
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
@@ -218,7 +81,7 @@
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    // 4. WebSocket Payload Example (Where you will connect your backend)
+    // 4. WebSocket Payload Example
     /*
     const socket = new WebSocket('ws://localhost:8000/ws');
     socket.onmessage = function(event) {
