@@ -140,15 +140,22 @@ def is_likely_question(message, msg_type="chat"):
         
     message_lower = clean_message.lower()
 
-    # Fast Exits 
+    # Statements that look like questions but usually aren't
+    looks_like_question_starters = (
+        "what a ", "what an ", "how nice", "how cool", "how cute", "how i",
+        "where i", "when i", "when you", "where you", "why i", "why you"
+    )
+    if any(
+        re.search(r'(?<![a-z0-9]){}\b'.format(re.escape(starter.strip())), message_lower)
+        for starter in looks_like_question_starters
+    ):
+        return False
+
+    # Fast Exits
     if message_lower.endswith("?"):
         _log_question_detection(message, msg_type, "question mark")
         return True
     if message_lower.endswith("..."):
-        return False
-
-    # Statements that look like questions but usually aren't
-    if message_lower.startswith(("what a ", "what an ", "how nice", "how cool", "how cute", "how i", "where i", "when i", "when you", "where you", "why i", "why you")):
         return False
 
     # Common question starters

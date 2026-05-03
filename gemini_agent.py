@@ -11,13 +11,14 @@ from utils import Message, log_json, shared_deque, get_streamer_name
 
 
 class GeminiAgent:
-    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60):
+    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel("gemini-3-flash-preview")
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
         self.qa_context_window = qa_context_window
+        self.enable_visual_context = enable_visual_context
         self.item_duplicate_window_seconds = 240
         self._item_lock = threading.Lock()
         self._seen_item_events = []
@@ -30,7 +31,7 @@ class GeminiAgent:
         if game_name:
             self.game_name = game_name
 
-    def ask_gemini(self, username, question, source_type="chat", timestamp=None):
+    def ask_gemini(self, username, question, source_type="chat", timestamp=None, video_frames_deque=None):
         msg_time = timestamp if timestamp is not None else self._current_timestamp()
         
         all_messages = shared_deque.get_recent()
@@ -42,7 +43,7 @@ class GeminiAgent:
 
         prompt = f"""
         You are an AI assistant. 
-        Read the provided transcript from a {self.game_name} stream by {get_streamer_name(self.log_folder)}, then answer the specific target question.
+        Read the provided transcript from a {self.game_name} stream by {get_streamer_name}, then answer the specific target question.
         Do not answer any other questions found in the transcript. 
         If you do not have enough context to answer, or the question doesn't have an objective factual answer return exactly: NO_ANSWER
         If answering, write one concise sentence or short paragraph that can be understood without seeing the original question.
@@ -53,8 +54,19 @@ Context:
 
 Target Question from '{username}':
 {question}"""
+
+        contents = [prompt]
+
+        if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
+            frames = list(video_frames_deque)
+            step = max(1, len(frames) // 5)
+            for frame in frames[::step][:5]:
+                rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = PIL.Image.fromarray(rgb_f)
+                contents.append(img)
+
         try:
-            response = self.model.generate_content(prompt)
+            response = self.model.generate_content(contents)
             answer = response.text.strip()            
             if not answer or answer == "NO_ANSWER":
                 return None
@@ -106,7 +118,7 @@ Context:
 
         contents = [prompt]
 
-        if video_frames_deque and len(video_frames_deque) > 0:
+        if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
             frames = list(video_frames_deque)
             step = max(1, len(frames) // 5)
             for frame in frames[::step][:5]:
