@@ -7,16 +7,17 @@ import cv2
 import google.generativeai as genai
 import PIL.Image
 
-from utils import Message, log_json, shared_deque
+from utils import Message, log_json, shared_deque, get_streamer_name
 
 
 class GeminiAgent:
-    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None):
+    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel("gemini-3-flash-preview")
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
+        self.qa_context_window = qa_context_window
         self.item_duplicate_window_seconds = 240
         self._item_lock = threading.Lock()
         self._seen_item_events = []
@@ -30,26 +31,34 @@ class GeminiAgent:
             self.game_name = game_name
 
     def ask_gemini(self, username, question, source_type="chat", timestamp=None):
+        msg_time = timestamp if timestamp is not None else self._current_timestamp()
+        
+        all_messages = shared_deque.get_recent()
+        context_msgs = [
+            str(m) for m in all_messages
+            if abs(msg_time - m.timestamp) <= self.qa_context_window
+        ]
+        context_str = "\n".join(context_msgs) if context_msgs else "No recent context available."
+
         prompt = f"""
-The {source_type} message from '{username}' contains this question:
-"{question}"
+        You are an AI assistant. 
+        Read the provided transcript from a {self.game_name} stream by {get_streamer_name(self.log_folder)}, then answer the specific target question.
+        Do not answer any other questions found in the transcript. 
+        If you do not have enough context to answer, or the question doesn't have an objective factual answer return exactly: NO_ANSWER
+        If answering, write one concise sentence or short paragraph that can be understood without seeing the original question.
+        Do not include labels, markdown, apologies, caveats, or additional commentary.
 
-The stream is about {self.game_name}.
+Context:
+{context_str}
 
-Answer only if the question is about the game being played on stream or has an objective, factual answer.
-If the question is subjective, personal, rhetorical, or cannot be answered from general factual knowledge, return exactly:
-NO_ANSWER
-
-If answering, write one concise sentence or short paragraph that can be understood without seeing the original question.
-Do not include labels, markdown, apologies, caveats, or additional commentary.
-"""
+Target Question from '{username}':
+{question}"""
         try:
             response = self.model.generate_content(prompt)
-            answer = response.text.strip()
+            answer = response.text.strip()            
             if not answer or answer == "NO_ANSWER":
                 return None
 
-            msg_time = timestamp if timestamp is not None else self._current_timestamp()
             gemini_msg = Message(
                 msg_time,
                 "gemini",

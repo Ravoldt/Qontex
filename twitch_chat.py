@@ -40,8 +40,8 @@ class TwitchChatListener(commands.Bot):
             raise ValueError("TWITCH_TOKEN is required for Twitch chat.")
         return token if token.startswith("oauth:") else f"oauth:{token}"
 
-    def is_likely_question(self, message):
-        return is_likely_question(message)
+    def is_likely_question(self, message, msg_type="chat"):
+        return is_likely_question(message, msg_type)
 
     def handle_question(self, msg):
         self.question_queue.append({"user": msg.user, "msg": msg.text, "timestamp": msg.timestamp})
@@ -51,6 +51,10 @@ class TwitchChatListener(commands.Bot):
     def listen(self):
         asyncio.set_event_loop(self._event_loop)
         self._event_loop.run_until_complete(self.start())
+
+    def stop(self):
+        if self._event_loop.is_running():
+            self._event_loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
 
     async def event_ready(self):
         print(f"TwitchIO connected as {self.bot_nick}. Joined #{self.channel}.")
@@ -75,9 +79,8 @@ class TwitchChatListener(commands.Bot):
         log_json(self.log_folder, "merged.json", msg.to_dict())
         shared_deque.add_message(msg)
 
-        if self.is_likely_question(chat_msg):
+        if self.is_likely_question(msg.text, msg.type):
             self.handle_question(msg)
-            print(f"\r[!] New question detected! (Total in queue: {len(self.question_queue)})")
 
         await self.handle_commands(message)
 

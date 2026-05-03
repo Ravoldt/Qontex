@@ -1,13 +1,50 @@
 import os
 import json
+import re
 import subprocess
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from collections import deque
 import threading
+from transformers import pipeline
 
 _log_lock = threading.Lock()
+_config_lock = threading.Lock()
+_classifier = None
+_config = {}
+
+def load_config(path="config.json"):
+    """Load config from disk and update the shared runtime config."""
+    global _config
+    with open(path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    with _config_lock:
+        _config = config
+    return config
+
+def reload_config(path="config.json"):
+    return load_config(path)
+
+def get_config_value(key, default=None):
+    with _config_lock:
+        return _config.get(key, default)
+
+def _log_question_detection(message, msg_type, method, score=None, detail=None):
+    if not get_config_value("LOG_QUESTION_DETECTIONS", True):
+        return
+
+    source_tag = "[CHAT]" if msg_type == "chat" else "[TRANSCRIPT]"
+    detail_text = f" [{detail}]" if detail else ""
+    if score is None:
+        print(f"\r[!] Detected {source_tag} question via {method}{detail_text}: {message}")
+    else:
+        print(f"\r[!] Detected {source_tag} question via {method}{detail_text} (Score: {score:.2f}): {message}")
+
+try:
+    load_config()
+except Exception:
+    _config = {}
 
 class Message:
     def __init__(self, timestamp, msg_type, text, user=None, **kwargs):
@@ -36,7 +73,7 @@ class Message:
     def __str__(self):
         ts = self.format_timestamp()
         if self.type == "transcript":
-            return "{} TRANSCRIPT: {}".format(ts, self.text)
+            return "{} {}: {}".format(ts, self.user or "TRANSCRIPT", self.text)
         elif self.type == "chat":
             return "{} {}: {}".format(ts, self.user, self.text)
         else:
@@ -44,8 +81,7 @@ class Message:
 
 def get_streamer_name(source):
     """Extract streamer name from URL or return as is."""
-    if source.startswith("http"):
-        # e.g., https://www.twitch.tv/babylon340 -> babylon340
+    if source.startswith("http"):        
         parts = source.rstrip('/').split('/')
         return parts[-1]
     else:
@@ -75,19 +111,96 @@ def log_json(folder, filename, data, mode='a'):
             json.dump(data, f, ensure_ascii=False)
             f.write('\n')
 
-def is_likely_question(message):
+def preload_classifier():
+    global _classifier
+    if _classifier is None:
+        import torch
+        from transformers import pipeline
+        device = 0 if torch.cuda.is_available() else -1
+        print(f"Loading Question Classifier into {'VRAM' if device == 0 else 'RAM'}...")        
+        _classifier = pipeline(
+            "text-classification", 
+            model="shahrukhx01/question-vs-statement-classifier", 
+            device=device
+        )
+
+def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
-    message = message.lower().strip()
-    if message.endswith("?"):
+    global _classifier
+    
+    clean_message = message.strip()
+    
+    # Strip emotes from chat messages to avoid confusing the AI classifier
+    if msg_type == "chat":
+        clean_message = re.sub(r'\b[a-z]+[A-Z][A-Za-z]*\b', '', clean_message)
+        clean_message = re.sub(r'\s+', ' ', clean_message).strip()
+    
+    if not clean_message:
+        return False
+        
+    message_lower = clean_message.lower()
+
+    # Fast Exits 
+    if message_lower.endswith("?"):
+        _log_question_detection(message, msg_type, "question mark")
         return True
-    question_starters = [
-        "who", "what", "where", "when", "why", "how", "can you", "is there",
-        "do you", "does it", "are there", "could you", "would you", "should i",
-        "will it", "can i", "should we", "is this", "is that", "did he",
-        "did she", "did they", "does this", "does that", "i'm curious",
-        "anyone know", "does anyone"
-    ]
-    return any(message.startswith(q) for q in question_starters)
+    if message_lower.endswith("..."):
+        return False
+
+    # Statements that look like questions but usually aren't
+    if message_lower.startswith(("what a ", "what an ", "how nice", "how cool", "how cute", "how i", "where i", "when i", "when you", "where you", "why i", "why you")):
+        return False
+
+    # Common question starters
+    question_starters = (
+        "who ", "what ", "where ", "when ", "why ", "how ", 
+        "is there ", "are there ", "can i ", "do you ", "did you ", "have you ", "does he ", "what's ", "who's ", "where's ", "when's ", "why's ", "how's ",
+        "is it ", "are they ", "could i ", "i wonder if ", "anyone know ", "can anyone ", "does anyone ", "would anyone ", "should i ", "am i "
+    )
+    matched_starter = next(
+        (
+            starter.strip()
+            for starter in question_starters
+            if re.search(r'(?<![a-z0-9]){}\b'.format(re.escape(starter.strip())), message_lower)
+        ),
+        None,
+    )
+    if matched_starter:
+        _log_question_detection(message, msg_type, "starter phrase", detail=matched_starter)
+        return True
+
+    words = message_lower.split()
+
+    # Length filter for chat only
+    if msg_type == "chat":        
+        filter_short = get_config_value("FILTER_SHORT_QUESTIONS", True)
+        threshold = get_config_value("SHORT_QUESTION_THRESHOLD", 2)
+        if filter_short and len(words) <= threshold:
+            return False
+
+        # The Backseater Bypass, Drop long paragraphs without question marks
+        if len(words) > 15 and "?" not in message:
+            return False
+
+    # AI Classification
+    if _classifier is None:
+        preload_classifier()
+
+    results = _classifier(clean_message, top_k=None)
+    predictions = results[0] if results and isinstance(results[0], list) else results
+
+    question_score = 0.0
+    for prediction in predictions:
+        if prediction['label'].lower() in ["question", "label_1"]:
+            question_score = prediction['score']
+            break
+            
+    is_question = question_score >= 0.50
+    
+    if is_question:
+        _log_question_detection(message, msg_type, "AI classifier", question_score)
+        
+    return is_question
 
 def log_start_stop(folder, action, uptime=None):
     """Log start or stop with datetime and optional uptime."""
@@ -118,6 +231,10 @@ class SharedDeque:
     def get_recent(self):
         with self.lock:
             return list(self.deque)
+
+    def clear(self):
+        with self.lock:
+            self.deque.clear()
 
 # Global shared deque
 shared_deque = SharedDeque()
