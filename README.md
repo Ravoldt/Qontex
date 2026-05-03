@@ -1,8 +1,8 @@
 # Qontex
 
-Qontex is a stream context agent for Twitch streams and local video files. It captures stream audio, transcribes speech with Whisper, listens to Twitch chat, detects likely questions, and can use Gemini to answer questions from recent stream context. It also writes structured timeline logs that combine transcript, chat, and AI responses. *Currently the question detection a bit hit or miss.
+Qontex is a stream context agent for Twitch streams and local video files. It captures stream audio, transcribes speech with Whisper, listens to Twitch chat, detects likely questions, and can use Gemini to answer questions from recent stream context. It also writes structured timeline logs that combine transcript, chat, and AI responses. 
 
-*Transrcibing a stream and syncing the transcription with chat messages works really well.*
+*Currently the question detection a bit hit or miss. Transrcibing a stream and syncing the transcription with chat messages works really well.*
 
 ## Features
 
