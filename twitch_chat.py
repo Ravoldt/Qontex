@@ -1,11 +1,12 @@
 import asyncio
 import datetime
 import os
+import time
 import threading
-
+import twitchio
 from twitchio.ext import commands
 
-from utils import Message, create_stream_folder, is_likely_question, log_json, log_message, shared_deque, refresh_twitch_token
+from utils import Message, create_stream_folder, get_config_value, is_likely_question, load_config, log_json, log_message, shared_deque, refresh_twitch_token
 
 
 class TwitchChatListener(commands.Bot):
@@ -29,22 +30,60 @@ class TwitchChatListener(commands.Bot):
         self.stream_start_handler = stream_start_handler
         self.question_queue = []
         self.stream_category = None
+        self._fallback_start = time.time()
+        self._info_loop_started = False
         self._event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._event_loop)
 
-        token = self._normalize_token(password)
-        super().__init__(token=token, prefix="!", initial_channels=[self.channel], loop=self._event_loop)
+        self.twitch_token = self._normalize_token(password)
+        super().__init__(
+            client_id=os.getenv("TWITCH_CLIENT_ID"),
+            client_secret=os.getenv("TWITCH_CLIENT_SECRET"),
+            bot_id=os.getenv("TWITCH_BOT_ID"),
+            prefix="!",
+        )
 
     def _normalize_token(self, token):
         if not token:
             raise ValueError("TWITCH_TOKEN is required for Twitch chat.")
-        return token if token.startswith("oauth:") else f"oauth:{token}"
+        token = token.strip()
+        if token.startswith("oauth:"):
+            return token.removeprefix("oauth:")
+        if token.startswith("OAuth "):
+            return token.removeprefix("OAuth ")
+        if token.startswith("Bearer "):
+            return token.removeprefix("Bearer ")
+        return token
+
+    async def setup_hook(self):
+        refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
+        if not refresh_token:
+            raise ValueError("TWITCH_REFRESH_TOKEN is required for Twitch EventSub chat.")
+
+        validated = await self.add_token(self.twitch_token, refresh_token)
+        client_id = os.getenv("TWITCH_CLIENT_ID")
+        if validated.client_id != client_id:
+            raise ValueError(
+                "TWITCH_TOKEN was issued for client ID "
+                f"{validated.client_id}, but TWITCH_CLIENT_ID is {client_id}."
+            )
+
+        if validated.user_id != self.bot_id:
+            raise ValueError(
+                "TWITCH_TOKEN belongs to user ID "
+                f"{validated.user_id}, but TWITCH_BOT_ID is {self.bot_id}."
+            )
+
+        if "user:read:chat" not in validated.scopes:
+            raise ValueError("TWITCH_TOKEN must include the user:read:chat scope.")
 
     def is_likely_question(self, message, msg_type="chat"):
         return is_likely_question(message, msg_type)
 
     def handle_question(self, msg):
         self.question_queue.append({"user": msg.user, "msg": msg.text, "timestamp": msg.timestamp})
+        if len(self.question_queue) > 20:
+            self.question_queue.pop(0)
         if self.question_handler:
             threading.Thread(target=self.question_handler, args=(msg,), daemon=True).start()
 
@@ -57,20 +96,35 @@ class TwitchChatListener(commands.Bot):
             self._event_loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
 
     async def event_ready(self):
-        print(f"TwitchIO connected as {self.bot_nick}. Joined #{self.channel}.")
-        await self.refresh_stream_info()
-        asyncio.create_task(self.refresh_stream_info_loop())
+        print(f"Logged in to Twitch as | {self.bot_nick}")
 
-    async def event_message(self, message):
-        if getattr(message, "echo", False):
+        # 1. Fetch the streamer's user info to get their numeric Broadcaster ID
+        users = await self.fetch_users(logins=[self.channel])
+        if not users:
+            print(f"Could not find Twitch channel: {self.channel}")
             return
+        broadcaster_id = users[0].id
 
-        username = getattr(getattr(message, "author", None), "name", None) or "unknown"
-        chat_msg = getattr(message, "content", "").strip()
+        subscription = twitchio.eventsub.ChatMessageSubscription(
+            broadcaster_user_id=broadcaster_id,
+            user_id=self.bot_id
+        )
+
+        await self.subscribe_websocket(payload=subscription)
+        print(f"Successfully subscribed to live chat for {self.channel}!")
+        
+        if not self._info_loop_started:
+            self._info_loop_started = True
+            asyncio.create_task(self.refresh_stream_info_loop())
+
+    async def event_message(self, message):  # Changed parameter to 'message' for consistency with twitchio
+        author = getattr(message, "author", None) or getattr(message, "chatter", None)
+        username = getattr(author, "name", None) or "unknown"
+        chat_msg = (getattr(message, "content", None) or getattr(message, "text", "")).strip()
         if not chat_msg:
             return
 
-        msg_time = self.start_time_ref() if self.start_time_ref else datetime.datetime.now().timestamp()
+        msg_time = self.start_time_ref() if self.start_time_ref else (time.time() - self._fallback_start)
         msg = Message(msg_time, "chat", chat_msg, user=username)
 
         print(f"\r{msg}")
@@ -79,15 +133,14 @@ class TwitchChatListener(commands.Bot):
         log_json(self.log_folder, "merged.json", msg.to_dict())
         shared_deque.add_message(msg)
 
-        if self.is_likely_question(msg.text, msg.type):
+        should_detect_question = self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+        if should_detect_question and self.is_likely_question(msg.text, msg.type):
             self.handle_question(msg)
-
-        await self.handle_commands(message)
 
     async def refresh_stream_info_loop(self):
         while True:
-            await asyncio.sleep(300)
             await self.refresh_stream_info()
+            await asyncio.sleep(300)
 
     async def refresh_stream_info(self):
         category, started_at = await self.fetch_stream_info()
@@ -120,21 +173,18 @@ class TwitchChatListener(commands.Bot):
 
 
 if __name__ == "__main__":
-    import json
-
     from dotenv import load_dotenv
 
     load_dotenv()
     refresh_twitch_token()
-    with open("config.json", "r") as f:
-        config = json.load(f)
+    config = load_config()
 
     NICK = config.get("TWITCH_USERNAME")
     CHANNEL = config.get("CHANNEL")
     PASS = os.getenv("TWITCH_TOKEN")
 
     if not CHANNEL:
-        print("Please set the CHANNEL in config.json!")
+        print("Please set the CHANNEL in config.toml!")
         exit(1)
 
     log_folder = create_stream_folder(CHANNEL.lstrip("#"), datetime.datetime.now())
