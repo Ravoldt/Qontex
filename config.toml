@@ -1,0 +1,42 @@
+# The channel name for the twitch stream the script will listen to
+# Can be a url, local file path, or simply the streamer's name
+CHANNEL = "channel"
+
+# The username for the account that generated the TWITCH_TOKEN in the .env
+# This setting requires a restart 
+TWITCH_USERNAME = "username"
+
+# Should the transcription run as fast as possible for local files or treat them as a livestream
+PROCESS_FAST = false 
+
+# Should questions be sent to gemini automatically
+ENABLE_QA = true
+
+# Should gemini's answers be kept in their own file 
+LOG_ANSWERS_SEPARATELY = true
+
+# Should questions from chat be answered if ENABLE_QA is true
+ENABLE_QA_CHAT = false
+
+# Should questions from the whisper transcript be answered if ENABLE_QA is true
+ENABLE_QA_TRANSCRIPT = true
+
+# Should gemini run periodically to check if new items were collected
+# Currently broken
+ENABLE_ITEMS = false
+
+# The length of the deque sent to gemini
+QA_CONTEXT_WINDOW = 60
+
+# Should frame data from the stream be included in the deque sent to gemini
+# Setting this to true will greatly increase api token usage!
+ENABLE_VISUAL_CONTEXT = false
+
+# Should the script declare when a new question is detected
+LOG_QUESTION_DETECTIONS = true
+
+# Should short questions skip the question detection step
+FILTER_SHORT_QUESTIONS = false
+
+# Message is a short question if it has <= this many words
+SHORT_QUESTION_THRESHOLD = 2

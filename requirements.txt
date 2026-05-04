@@ -1,1 +1,10 @@
-twitchio>=2.10,<3
+faster-whisper>=1.1
+google-generativeai>=0.8
+numpy>=1.26
+opencv-python>=4.9
+Pillow>=10.0
+python-dotenv>=1.0
+streamlink>=6.0
+torch>=2.2
+transformers>=4.40
+twitchio>=3.2.2

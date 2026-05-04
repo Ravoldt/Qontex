@@ -7,4 +7,6 @@ lore/
 video/
 logs/
 __pycache__/
-chat.json
+local.toml
+.tio.tokens.json
+dev/
