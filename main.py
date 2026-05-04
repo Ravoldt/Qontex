@@ -3,6 +3,7 @@ import os
 import time
 import datetime
 import argparse
+import re
 from dotenv import load_dotenv
 
 from utils import create_stream_folder, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque
@@ -13,7 +14,7 @@ import streamlink as my_streamlink
 def resolve_config(config):
     channel = config.get("CHANNEL")
     if not channel:
-        raise ValueError("Please set the CHANNEL in config.json!")
+        raise ValueError("Please set the CHANNEL in config.toml!")
 
     is_local_video = os.path.isfile(channel)
     if not is_local_video:
@@ -32,9 +33,12 @@ def resolve_config(config):
         "twitch_username": config.get("TWITCH_USERNAME"),
         "process_fast": config.get("PROCESS_FAST", False),
         "enable_qa": config.get("ENABLE_QA", True),
+        "enable_qa_chat": config.get("ENABLE_QA_CHAT", True),
+        "enable_qa_transcript": config.get("ENABLE_QA_TRANSCRIPT", True),
         "enable_items": config.get("ENABLE_ITEMS", True),
         "enable_visual_context": config.get("ENABLE_VISUAL_CONTEXT", False),
         "qa_context_window": config.get("QA_CONTEXT_WINDOW", 60),
+        "log_answers_separately": config.get("LOG_ANSWERS_SEPARATELY", False),
     }
 
 def main():
@@ -56,7 +60,7 @@ def main():
         config = load_config()
         runtime_config = resolve_config(config)
     except FileNotFoundError:
-        print("CRITICAL ERROR: config.json is missing!")
+        print("CRITICAL ERROR: config.toml is missing!")
         exit(1)
     except ValueError as e:
         print(e)
@@ -150,6 +154,8 @@ def main():
             game_name=runtime_config["game_name"],
             qa_context_window=runtime_config["qa_context_window"],
             enable_visual_context=runtime_config["enable_visual_context"],
+            streamer_name=runtime_config["stream_name"],
+            log_answers_separately=runtime_config["log_answers_separately"],
         )
 
         def item_processor():
@@ -161,7 +167,7 @@ def main():
         processor_thread = threading.Thread(target=item_processor, daemon=True)
         processor_thread.start()
         if not runtime_config["enable_items"]:
-            print("Gemini Item Processing is DISABLED via config.json.")
+            print("Gemini Item Processing is DISABLED via config.toml.")
     else:
         print("Gemini Agent is DISABLED (--no-gemini flag used).")
 
@@ -192,8 +198,12 @@ def main():
             agent.qa_context_window = config["qa_context_window"]
             agent.enable_visual_context = config["enable_visual_context"]
             agent.set_game_name(config["game_name"])
+            agent.streamer_name = config["stream_name"]
+            agent.log_answers_separately = config["log_answers_separately"]
 
         qa_handler = current_qa_handler(config)
+        qa_handler_chat = qa_handler if config["enable_qa_chat"] else None
+        qa_handler_transcript = qa_handler if config["enable_qa_transcript"] else None
         PASS = os.getenv("TWITCH_TOKEN")
 
         if not config["is_local_video"]:
@@ -203,7 +213,7 @@ def main():
                 config["channel"],
                 folder,
                 start_time_ref=get_msg_time,
-                question_handler=qa_handler,
+                question_handler=qa_handler_chat,
                 category_handler=update_stream_category,
                 stream_start_handler=update_stream_start,
             )
@@ -220,7 +230,7 @@ def main():
         capture_stop = threading.Event()
         capture_thread = threading.Thread(
             target=my_streamlink.run_capture_loop,
-            args=(config["source"], folder, config["process_fast"], qa_handler, capture_stop),
+            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop),
             daemon=True,
         )
         capture_thread.start()
@@ -228,10 +238,75 @@ def main():
         runtime["capture_thread"] = capture_thread
 
     start_runtime(runtime_config, log_folder)
-
     
     while True:
-        cmd = input("Cmd (status, clear, reload, quit)> ").strip().lower()
+        raw_cmd = input("Cmd (status, clear, reload, quit, /<config> <val>, /ask <q>)> ").strip()
+        if not raw_cmd:
+            continue
+            
+        cmd = raw_cmd.lower()
+        
+        if raw_cmd.startswith("/"):
+            parts = raw_cmd[1:].split(maxsplit=1)
+            if not parts:
+                continue
+            command = parts[0].lower()
+            
+            if command == "ask":
+                if len(parts) > 1:
+                    question = parts[1]
+                    if agent:
+                        print(f"Asking Gemini: {question}")
+                        threading.Thread(
+                            target=agent.ask_gemini,
+                            args=("Console", question),
+                            kwargs={
+                                "source_type": "console",
+                                "timestamp": get_msg_time(),
+                                "video_frames_deque": my_streamlink.video_frames
+                            },
+                            daemon=True
+                        ).start()
+                    else:
+                        print("Gemini Agent is DISABLED.")
+                else:
+                    print("Usage: /ask <question>")
+                continue
+            else:
+                if len(parts) > 1:
+                    key = command.upper()
+                    val_str = parts[1].strip()
+                    
+                    if val_str.lower() == "true":
+                        val_str = "true"
+                    elif val_str.lower() == "false":
+                        val_str = "false"
+                    elif val_str.isdigit():
+                        pass
+                    elif not (val_str.startswith('"') and val_str.endswith('"')):
+                        val_str = f'"{val_str}"'
+                        
+                    try:
+                        config_path = "config.toml"
+                        with open(config_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        
+                        pattern = re.compile(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$")
+                        if pattern.search(content):
+                            content = pattern.sub(f"{key} = {val_str}", content)
+                        else:
+                            content = content.rstrip() + f"\n{key} = {val_str}\n"
+                            
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        print(f"Updated {key} to {val_str} in {config_path}")
+                        cmd = "reload"
+                    except Exception as e:
+                        print(f"Failed to update config.toml: {e}")
+                        continue
+                else:
+                    print(f"Usage: /{command} <value>")
+                    continue
         
         if cmd in ("status", "list"):
             print("\n--- Status ---")
@@ -269,12 +344,16 @@ def main():
                 changed_channel
                 or new_config["process_fast"] != old_config["process_fast"]
                 or new_config["enable_qa"] != old_config["enable_qa"]
+                or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
+                or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
             )
 
             if agent:
                 agent.qa_context_window = new_config["qa_context_window"]
                 agent.enable_visual_context = new_config["enable_visual_context"]
                 agent.set_game_name(new_config["game_name"])
+                agent.streamer_name = new_config["stream_name"]
+                agent.log_answers_separately = new_config["log_answers_separately"]
             runtime["enable_items"] = new_config["enable_items"]
 
             if changed_capture:
