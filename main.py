@@ -1,12 +1,13 @@
 import threading
 import os
+import json
 import time
 import datetime
 import argparse
 import re
 from dotenv import load_dotenv
 
-from utils import create_stream_folder, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque
+from utils import create_stream_folder, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque, flush_json_buffer
 from twitch_chat import TwitchChatListener
 from gemini_agent import GeminiAgent
 import streamlink as my_streamlink
@@ -188,6 +189,8 @@ def main():
         runtime["capture_thread"] = None
         runtime["capture_stop"] = None
 
+        flush_json_buffer(force=True)
+
     def start_runtime(config, folder):
         runtime["config"] = config
         runtime["log_folder"] = folder
@@ -239,149 +242,187 @@ def main():
 
     start_runtime(runtime_config, log_folder)
     
-    while True:
-        raw_cmd = input("Cmd (status, clear, reload, quit, /<config> <val>, /ask <q>)> ").strip()
-        if not raw_cmd:
-            continue
-            
-        cmd = raw_cmd.lower()
-        
-        if raw_cmd.startswith("/"):
-            parts = raw_cmd[1:].split(maxsplit=1)
-            if not parts:
+    try:
+        while True:
+            raw_cmd = input("Cmd (status, timeline, clear, reload, quit, /<config> <val>, /ask <q>)> ").strip()
+            if not raw_cmd:
                 continue
-            command = parts[0].lower()
-            
-            if command == "ask":
-                if len(parts) > 1:
-                    question = parts[1]
-                    if agent:
-                        print(f"Asking Gemini: {question}")
-                        threading.Thread(
-                            target=agent.ask_gemini,
-                            args=("Console", question),
-                            kwargs={
-                                "source_type": "console",
-                                "timestamp": get_msg_time(),
-                                "video_frames_deque": my_streamlink.video_frames
-                            },
-                            daemon=True
-                        ).start()
-                    else:
-                        print("Gemini Agent is DISABLED.")
-                else:
-                    print("Usage: /ask <question>")
-                continue
-            else:
-                if len(parts) > 1:
-                    key = command.upper()
-                    val_str = parts[1].strip()
-                    
-                    if val_str.lower() == "true":
-                        val_str = "true"
-                    elif val_str.lower() == "false":
-                        val_str = "false"
-                    elif val_str.isdigit():
-                        pass
-                    elif not (val_str.startswith('"') and val_str.endswith('"')):
-                        val_str = f'"{val_str}"'
-                        
-                    try:
-                        config_path = "config.toml"
-                        with open(config_path, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        
-                        pattern = re.compile(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$")
-                        if pattern.search(content):
-                            content = pattern.sub(f"{key} = {val_str}", content)
-                        else:
-                            content = content.rstrip() + f"\n{key} = {val_str}\n"
-                            
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        print(f"Updated {key} to {val_str} in {config_path}")
-                        cmd = "reload"
-                    except Exception as e:
-                        print(f"Failed to update config.toml: {e}")
-                        continue
-                else:
-                    print(f"Usage: /{command} <value>")
-                    continue
-        
-        if cmd in ("status", "list"):
-            print("\n--- Status ---")
-
-            print(f"Gemini Agent: {'ACTIVE' if agent else 'OFFLINE'}")
-            print(f"Channel: {runtime['config']['channel']}")
-            print(f"Capture: {'ACTIVE' if runtime['capture_thread'] and runtime['capture_thread'].is_alive() else 'OFFLINE'}")
-            print(f"Chat Listener: {'ACTIVE' if runtime['chat_listener'] else 'OFFLINE'}")
-            
-
-            chat_listener = runtime["chat_listener"]
-            if not chat_listener or not chat_listener.question_queue:
-                print("Question queue is empty.")
-            else:
-                print("Queued questions:")
-                for i, q in enumerate(chat_listener.question_queue):
-                    print(f"[{i}] {q['user']}: {q['msg']}")
-            print("--------------\n")
                 
-        elif cmd == "clear":
-            if runtime["chat_listener"]:
-                runtime["chat_listener"].question_queue.clear()
-            print("Queue cleared.\n")
+            cmd = raw_cmd.lower()
+            
+            if raw_cmd.startswith("/"):
+                parts = raw_cmd[1:].split(maxsplit=1)
+                if not parts:
+                    continue
+                command = parts[0].lower()
+                
+                if command == "ask":
+                    if len(parts) > 1:
+                        question = parts[1]
+                        if agent:
+                            print(f"Asking Gemini: {question}")
+                            threading.Thread(
+                                target=agent.direct_ask,
+                                args=(question,),
+                                kwargs={
+                                    "timestamp": get_msg_time(),
+                                    "video_frames_deque": my_streamlink.video_frames
+                                },
+                                daemon=True
+                            ).start()
+                        else:
+                            print("Gemini Agent is DISABLED.")
+                    else:
+                        print("Usage: /ask <question>")
+                    continue
+                else:
+                    if len(parts) > 1:
+                        key = command.upper()
+                        val_str = parts[1].strip()
+                        
+                        if val_str.lower() == "true":
+                            val_str = "true"
+                        elif val_str.lower() == "false":
+                            val_str = "false"
+                        elif val_str.isdigit():
+                            pass
+                        elif not (val_str.startswith('"') and val_str.endswith('"')):
+                            val_str = f'"{val_str}"'
+                            
+                        try:
+                            config_path = "config.toml"
+                            with open(config_path, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            
+                            pattern = re.compile(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$")
+                            if pattern.search(content):
+                                content = pattern.sub(f"{key} = {val_str}", content)
+                            else:
+                                content = content.rstrip() + f"\n{key} = {val_str}\n"
+                                
+                            with open(config_path, "w", encoding="utf-8") as f:
+                                f.write(content)
+                            print(f"Updated {key} to {val_str} in {config_path}")
+                            cmd = "reload"
+                        except Exception as e:
+                            print(f"Failed to update config.toml: {e}")
+                            continue
+                    else:
+                        print(f"Usage: /{command} <value>")
+                        continue
+            
+            if cmd in ("status", "list"):
+                print("\n--- Status ---")
 
-        elif cmd == "reload":
-            try:
-                new_config = resolve_config(reload_config())
-            except Exception as e:
-                print(f"Config reload failed: {e}\n")
-                continue
+                print(f"Gemini Agent: {'ACTIVE' if agent else 'OFFLINE'}")
+                print(f"Channel: {runtime['config']['channel']}")
+                print(f"Capture: {'ACTIVE' if runtime['capture_thread'] and runtime['capture_thread'].is_alive() else 'OFFLINE'}")
+                print(f"Chat Listener: {'ACTIVE' if runtime['chat_listener'] else 'OFFLINE'}")
+                
 
-            old_config = runtime["config"]
-            changed_channel = new_config["source"] != old_config["source"]
-            changed_capture = (
-                changed_channel
-                or new_config["process_fast"] != old_config["process_fast"]
-                or new_config["enable_qa"] != old_config["enable_qa"]
-                or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
-                or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
-            )
+                chat_listener = runtime["chat_listener"]
+                if not chat_listener or not chat_listener.question_queue:
+                    print("Question queue is empty.")
+                else:
+                    print("Queued questions:")
+                    for i, q in enumerate(chat_listener.question_queue):
+                        print(f"[{i}] {q['user']}: {q['msg']}")
+                print("--------------\n")
+                    
+            elif cmd == "timeline":
+                log_path = os.path.join(runtime["log_folder"], "merged.json")
+                # Always force a flush of the latest buffer data before reading timeline
+                flush_json_buffer(force=True)
+                if os.path.exists(log_path):
+                    try:
+                        lines = []
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                if line.strip():
+                                    try:
+                                        # Handle concurrent file writes gracefully
+                                        lines.append(json.loads(line))
+                                    except json.JSONDecodeError:
+                                        continue
+                        
+                        lines.sort(key=lambda x: x.get("timestamp", 0))
+                        
+                        print("\n--- Chronological Timeline ---")
+                        for entry in lines:
+                            ts = max(0, int(entry.get("timestamp", 0)))
+                            hours, remainder = divmod(ts, 3600)
+                            minutes, seconds = divmod(remainder, 60)
+                            ts_str = f"[{hours}:{minutes:02d}:{seconds:02d}]"
+                            user = entry.get("user") or entry.get("type", "UNKNOWN").upper()
+                            print(f"{ts_str} {user}: {entry.get('text', '')}")
+                        print("------------------------------\n")
+                    except Exception as e:
+                        print(f"Error reading timeline: {e}\n")
+                else:
+                    print("No merged.json found for the current session yet.\n")
 
-            if agent:
-                agent.qa_context_window = new_config["qa_context_window"]
-                agent.enable_visual_context = new_config["enable_visual_context"]
-                agent.set_game_name(new_config["game_name"])
-                agent.streamer_name = new_config["stream_name"]
-                agent.log_answers_separately = new_config["log_answers_separately"]
-            runtime["enable_items"] = new_config["enable_items"]
+            elif cmd == "clear":
+                if runtime["chat_listener"]:
+                    runtime["chat_listener"].question_queue.clear()
+                print("Queue cleared.\n")
 
-            if changed_capture:
+            elif cmd == "reload":
+                try:
+                    new_config = resolve_config(reload_config())
+                except Exception as e:
+                    print(f"Config reload failed: {e}\n")
+                    continue
+
+                old_config = runtime["config"]
+                changed_channel = new_config["source"] != old_config["source"]
+                changed_capture = (
+                    changed_channel
+                    or new_config["process_fast"] != old_config["process_fast"]
+                    or new_config["enable_qa"] != old_config["enable_qa"]
+                    or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
+                    or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
+                )
+
+                if agent:
+                    agent.qa_context_window = new_config["qa_context_window"]
+                    agent.enable_visual_context = new_config["enable_visual_context"]
+                    agent.set_game_name(new_config["game_name"])
+                    agent.streamer_name = new_config["stream_name"]
+                    agent.log_answers_separately = new_config["log_answers_separately"]
+                runtime["enable_items"] = new_config["enable_items"]
+
+                if changed_capture:
+                    uptime = time.time() - STREAM_START_TIME
+                    log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
+                    stop_runtime()
+                    if changed_channel:
+                        shared_deque.clear()
+                        my_streamlink.video_frames.clear()
+
+                    stream_start = datetime.datetime.now()
+                    new_log_folder = create_stream_folder(new_config["stream_name"], stream_start)
+                    log_start_stop(new_log_folder, "start")
+
+                    STREAM_START_TIME = time.time()
+                    my_streamlink.STREAM_START_TIME = STREAM_START_TIME
+                    start_runtime(new_config, new_log_folder)
+                    print(f"Reloaded config and restarted stream workers for {new_config['channel']}.\n")
+                else:
+                    runtime["config"] = new_config
+                    print("Reloaded config without restarting stream workers.\n")
+                
+            elif cmd == "quit":
                 uptime = time.time() - STREAM_START_TIME
                 log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
                 stop_runtime()
-                if changed_channel:
-                    shared_deque.clear()
-                    my_streamlink.video_frames.clear()
-
-                stream_start = datetime.datetime.now()
-                new_log_folder = create_stream_folder(new_config["stream_name"], stream_start)
-                log_start_stop(new_log_folder, "start")
-
-                STREAM_START_TIME = time.time()
-                my_streamlink.STREAM_START_TIME = STREAM_START_TIME
-                start_runtime(new_config, new_log_folder)
-                print(f"Reloaded config and restarted stream workers for {new_config['channel']}.\n")
-            else:
-                runtime["config"] = new_config
-                print("Reloaded config without restarting stream workers.\n")
-            
-        elif cmd == "quit":
-            uptime = time.time() - STREAM_START_TIME
-            log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
-            stop_runtime()
-            print("Shutting down...")
-            break
+                print("Shutting down...")
+                break
+                
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt received. Shutting down...")
+        uptime = time.time() - STREAM_START_TIME
+        log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
+        stop_runtime()
 
 if __name__ == "__main__":
     main()
