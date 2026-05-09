@@ -12,8 +12,8 @@ from utils import Message, log_json, shared_deque, get_streamer_name
 
 class GeminiAgent:
     def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False, streamer_name="the streamer", log_answers_separately=False):
-        client = genai.Client(api_key=api_key)
-        self.model_name = ("gemini-2.5-flash")
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = "gemini-2.5-flash"
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
@@ -78,7 +78,7 @@ Target Question from '{username}':
                 contents.append(img)
 
         try:
-            response = self.models.generate_content(contents)
+            response = self.client.models.generate_content(model=self.model_name, contents=contents)
             answer = response.text.strip()            
             if not answer or answer == "NO_ANSWER":
                 return None
@@ -131,7 +131,7 @@ Context:
                 contents.append(img)
 
         try:
-            response = self.model.generate_content(contents)
+            response = self.client.models.generate_content(model=self.model_name, contents=contents)
             answer = response.text.strip()
             
             print(f"\n[Gemini Console Response]:\n{answer}\n")
@@ -192,7 +192,7 @@ Context:
                 contents.append(img)
 
         try:
-            response = self.model.generate_content(contents)
+            response = self.client.models.generate_content(model=self.model_name, contents=contents)
             data = self._parse_json_object(response.text)
             data.setdefault("timestamp", timestamp)
             data.setdefault("items", [])
