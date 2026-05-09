@@ -9,8 +9,8 @@ TWITCH_USERNAME = "username"
 # Should the transcription run as fast as possible for local files or process them in realtime
 PROCESS_FAST = false 
 
-# Should the automatic question checker pipeline be active
-ENABLE_QUESTION_CHECKER = true
+# Should questions be automatically detected
+ENABLE_QUESTION_DETECTOR = true
 
 # Should questions be sent to gemini automatically
 ENABLE_QA = true

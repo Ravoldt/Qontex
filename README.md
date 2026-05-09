@@ -92,7 +92,7 @@ Live Twitch chat uses TwitchIO EventSub. `TWITCH_TOKEN` must belong to `TWITCH_B
 CHANNEL = "streamer_name_or_local_video_path"
 TWITCH_USERNAME = "your_twitch_username"
 PROCESS_FAST = false
-ENABLE_QUESTION_CHECKER = true
+ENABLE_QUESTION_DETECTOR = true
 ENABLE_QA = true
 ENABLE_QA_CHAT = false
 ENABLE_QA_TRANSCRIPT = true
@@ -111,7 +111,7 @@ Key options:
 - `CHANNEL`: Twitch channel name, `#channel`, Twitch URL, or local video path.
 - `TWITCH_USERNAME`: Twitch account label used by the chat listener.
 - `PROCESS_FAST`: For local videos, processes as fast as possible instead of realtime.
-- `ENABLE_QUESTION_CHECKER`: Enables heuristic and classifier-based question detection.
+- `ENABLE_QUESTION_DETECTOR`: Enables heuristic and classifier-based question detection.
 - `ENABLE_QA`: Allows detected questions to be sent to Gemini.
 - `ENABLE_QA_CHAT`: Enables Gemini answers for chat questions when QA is enabled.
 - `ENABLE_QA_TRANSCRIPT`: Enables Gemini answers for transcript questions when QA is enabled.

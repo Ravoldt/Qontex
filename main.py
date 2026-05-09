@@ -43,7 +43,7 @@ def resolve_config(config):
         "enable_qa": config.get("ENABLE_QA", True),
         "enable_qa_chat": config.get("ENABLE_QA_CHAT", True),
         "enable_qa_transcript": config.get("ENABLE_QA_TRANSCRIPT", True),
-        "enable_question_checker": config.get("ENABLE_QUESTION_CHECKER", True),
+        "ENABLE_QUESTION_DETECTOR": config.get("ENABLE_QUESTION_DETECTOR", True),
         "enable_items": config.get("ENABLE_ITEMS", True),
         "enable_visual_context": config.get("ENABLE_VISUAL_CONTEXT", False),
         "qa_context_window": config.get("QA_CONTEXT_WINDOW", 60),
@@ -138,7 +138,7 @@ def main():
         
     if not args.test_capture:
         from utils import preload_classifier
-        if runtime_config["enable_question_checker"]:
+        if runtime_config["ENABLE_QUESTION_DETECTOR"]:
             preload_classifier()
     print("All models successfully loaded!\n")
 
@@ -445,7 +445,7 @@ def main():
                     or new_config["enable_qa"] != old_config["enable_qa"]
                     or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
                     or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
-                    or new_config["enable_question_checker"] != old_config["enable_question_checker"]
+                    or new_config["ENABLE_QUESTION_DETECTOR"] != old_config["ENABLE_QUESTION_DETECTOR"]
                 )
 
                 if agent:

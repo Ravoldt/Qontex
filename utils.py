@@ -194,7 +194,7 @@ def preload_classifier():
 
 def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
-    if not get_config_value("ENABLE_QUESTION_CHECKER", True):
+    if not get_config_value("ENABLE_QUESTION_DETECTOR", True):
         return False
         
     global _classifier
