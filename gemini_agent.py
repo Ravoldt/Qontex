@@ -13,7 +13,7 @@ from utils import Message, log_json, shared_deque, get_streamer_name
 class GeminiAgent:
     def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False, streamer_name="the streamer", log_answers_separately=False):
         client = genai.Client(api_key=api_key)
-        self.model = ("gemini-1.5-flash-latest")
+        self.model_name = ("gemini-2.5-flash")
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
@@ -71,13 +71,14 @@ Target Question from '{username}':
 
         if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
             frames = list(video_frames_deque)[-int(self.qa_context_window):]
-            for frame in frames:
+            step = max(1, len(frames) // 5)
+            for frame in frames[::step][:5]:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
 
         try:
-            response = self.model.generate_content(contents)
+            response = self.models.generate_content(contents)
             answer = response.text.strip()            
             if not answer or answer == "NO_ANSWER":
                 return None
