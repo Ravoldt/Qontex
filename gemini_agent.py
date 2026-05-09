@@ -115,6 +115,7 @@ Target Question from '{username}':
         prompt = f"""
         One of {self.streamer_name}'s viewers has a question: {question}.
         Answer the question. Below is recent context from the stream that may help you answer.
+        Use the provided video frames as visual context to help answer the question.
 
 Context:
 {context_str}
@@ -129,6 +130,8 @@ Context:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
+                
+            print(f"[*] Attached {len(contents) - 1} video frames to Gemini direct ask.")
 
         try:
             response = self.client.models.generate_content(model=self.model_name, contents=contents)
