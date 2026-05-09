@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from utils import create_stream_folder, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque, flush_json_buffer
 from twitch_chat import TwitchChatListener
 from gemini_agent import GeminiAgent
-import streamlink as my_streamlink
+import streamcapture as my_streamlink
 
 def resolve_config(config):
     channel = config.get("CHANNEL")
@@ -19,8 +19,15 @@ def resolve_config(config):
 
     is_local_video = os.path.isfile(channel)
     if not is_local_video:
-        twitch_channel = channel if channel.startswith("#") else f"#{channel}"
-        source = twitch_channel.lstrip("#")
+        if not channel.startswith("http") and ("/" in channel or "\\" in channel or "." in channel):
+            raise ValueError(f"Local video file not found, or invalid Twitch channel name: '{channel}'")
+            
+        if channel.startswith("http"):
+            source = channel.rstrip('/').split('/')[-1]
+            twitch_channel = f"#{source}"
+        else:
+            twitch_channel = channel if channel.startswith("#") else f"#{channel}"
+            source = twitch_channel.lstrip("#")
     else:
         twitch_channel = channel
         source = channel
@@ -36,11 +43,25 @@ def resolve_config(config):
         "enable_qa": config.get("ENABLE_QA", True),
         "enable_qa_chat": config.get("ENABLE_QA_CHAT", True),
         "enable_qa_transcript": config.get("ENABLE_QA_TRANSCRIPT", True),
+        "enable_question_checker": config.get("ENABLE_QUESTION_CHECKER", True),
         "enable_items": config.get("ENABLE_ITEMS", True),
         "enable_visual_context": config.get("ENABLE_VISUAL_CONTEXT", False),
         "qa_context_window": config.get("QA_CONTEXT_WINDOW", 60),
         "log_answers_separately": config.get("LOG_ANSWERS_SEPARATELY", False),
     }
+
+def apply_process_fast_safety(config):
+    if not config["process_fast"]:
+        return config
+
+    config.update({
+        "enable_qa": False,
+        "enable_qa_chat": False,
+        "enable_qa_transcript": False,
+        "enable_items": False,
+        "enable_visual_context": False,
+    })
+    return config
 
 def main():
     parser = argparse.ArgumentParser(description="Qontex Stream AI Agent")
@@ -52,14 +73,9 @@ def main():
     load_dotenv()
     refresh_twitch_token()
     
-    api_key = os.getenv("GENAI_API_KEY")
-    if not api_key and not args.no_gemini:
-        print("CRITICAL ERROR: GENAI_API_KEY is missing! Please check your .env file.")
-        exit(1)
-
     try:
         config = load_config()
-        runtime_config = resolve_config(config)
+        runtime_config = apply_process_fast_safety(resolve_config(config))
     except FileNotFoundError:
         print("CRITICAL ERROR: config.toml is missing!")
         exit(1)
@@ -67,7 +83,28 @@ def main():
         print(e)
         exit(1)
 
+    gemini_disabled = args.no_gemini or runtime_config["process_fast"]
+    api_key = os.getenv("GENAI_API_KEY")
+    if not api_key and not gemini_disabled:
+        print("CRITICAL ERROR: GENAI_API_KEY is missing! Please check your .env file.")
+        exit(1)
+
+    if runtime_config["process_fast"]:
+        print("PROCESS_FAST is enabled; Gemini QA, item processing, and visual context are disabled.")
+
     stream_start = datetime.datetime.now()
+
+    if runtime_config["is_local_video"]:
+        chat_json_path = os.path.splitext(runtime_config["channel"])[0] + ".json"
+        if os.path.exists(chat_json_path):
+            from twitch_chat import LocalChatListener
+            temp_listener = LocalChatListener(chat_json_path, None, process_fast=runtime_config["process_fast"])
+            login_name = temp_listener.streamer_login or temp_listener.streamer_name
+            if login_name:
+                runtime_config["stream_name"] = login_name
+            if temp_listener.stream_start_date:
+                stream_start = temp_listener.stream_start_date
+
     log_folder = create_stream_folder(runtime_config["stream_name"], stream_start)
     log_start_stop(log_folder, "start")
 
@@ -101,7 +138,8 @@ def main():
         
     if not args.test_capture:
         from utils import preload_classifier
-        preload_classifier()
+        if runtime_config["enable_question_checker"]:
+            preload_classifier()
     print("All models successfully loaded!\n")
 
     # If running specific tests
@@ -147,7 +185,7 @@ def main():
     }
 
     agent = None
-    if not args.no_gemini:
+    if not gemini_disabled:
         agent = GeminiAgent(
             api_key,
             log_folder,
@@ -170,7 +208,8 @@ def main():
         if not runtime_config["enable_items"]:
             print("Gemini Item Processing is DISABLED via config.toml.")
     else:
-        print("Gemini Agent is DISABLED (--no-gemini flag used).")
+        reason = "PROCESS_FAST is enabled" if runtime_config["process_fast"] else "--no-gemini flag used"
+        print(f"Gemini Agent is DISABLED ({reason}).")
 
     def current_qa_handler(config):
         return answer_question if (agent and config["enable_qa"]) else None
@@ -209,6 +248,8 @@ def main():
         qa_handler_transcript = qa_handler if config["enable_qa_transcript"] else None
         PASS = os.getenv("TWITCH_TOKEN")
 
+        transcript_user = config["stream_name"]
+
         if not config["is_local_video"]:
             chat_listener = TwitchChatListener(
                 config["twitch_username"],
@@ -226,14 +267,35 @@ def main():
             runtime["listener_thread"] = listener_thread
             print(f"Connected to {config['channel']}. Listening for questions in the background...")
         else:
-            runtime["chat_listener"] = None
-            runtime["listener_thread"] = None
-            print(f"Local video '{config['channel']}' detected. Twitch chat listener is disabled.")
+            chat_json_path = os.path.splitext(config["channel"])[0] + ".json"
+            if os.path.exists(chat_json_path):
+                from twitch_chat import LocalChatListener
+                chat_listener = LocalChatListener(
+                    chat_json_path,
+                    folder,
+                    question_handler=qa_handler_chat,
+                    process_fast=config["process_fast"]
+                )
+                login_name = chat_listener.streamer_login or chat_listener.streamer_name
+                if login_name:
+                    transcript_user = login_name
+                    if agent:
+                        agent.streamer_name = login_name
+
+                listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
+                listener_thread.start()
+                runtime["chat_listener"] = chat_listener
+                runtime["listener_thread"] = listener_thread
+                print(f"Local video '{config['channel']}' detected. Found matching chat file: {chat_json_path}")
+            else:
+                runtime["chat_listener"] = None
+                runtime["listener_thread"] = None
+                print(f"Local video '{config['channel']}' detected. Twitch chat listener is disabled. (No matching .json found)")
 
         capture_stop = threading.Event()
         capture_thread = threading.Thread(
             target=my_streamlink.run_capture_loop,
-            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop),
+            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop, transcript_user),
             daemon=True,
         )
         capture_thread.start()
@@ -259,7 +321,9 @@ def main():
                 if command == "ask":
                     if len(parts) > 1:
                         question = parts[1]
-                        if agent:
+                        if runtime["config"]["process_fast"]:
+                            print("Gemini Agent is DISABLED while PROCESS_FAST is enabled.")
+                        elif agent:
                             print(f"Asking Gemini: {question}")
                             threading.Thread(
                                 target=agent.direct_ask,
@@ -368,7 +432,7 @@ def main():
 
             elif cmd == "reload":
                 try:
-                    new_config = resolve_config(reload_config())
+                    new_config = apply_process_fast_safety(resolve_config(reload_config()))
                 except Exception as e:
                     print(f"Config reload failed: {e}\n")
                     continue
@@ -381,6 +445,7 @@ def main():
                     or new_config["enable_qa"] != old_config["enable_qa"]
                     or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
                     or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
+                    or new_config["enable_question_checker"] != old_config["enable_question_checker"]
                 )
 
                 if agent:
@@ -400,6 +465,18 @@ def main():
                         my_streamlink.video_frames.clear()
 
                     stream_start = datetime.datetime.now()
+                    
+                    if new_config["is_local_video"]:
+                        chat_json_path = os.path.splitext(new_config["channel"])[0] + ".json"
+                        if os.path.exists(chat_json_path):
+                            from twitch_chat import LocalChatListener
+                            temp_listener = LocalChatListener(chat_json_path, None, process_fast=new_config["process_fast"])
+                            login_name = temp_listener.streamer_login or temp_listener.streamer_name
+                            if login_name:
+                                new_config["stream_name"] = login_name
+                            if temp_listener.stream_start_date:
+                                stream_start = temp_listener.stream_start_date
+
                     new_log_folder = create_stream_folder(new_config["stream_name"], stream_start)
                     log_start_stop(new_log_folder, "start")
 

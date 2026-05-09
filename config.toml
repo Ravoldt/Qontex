@@ -6,8 +6,11 @@ CHANNEL = "channel"
 # This setting requires a restart 
 TWITCH_USERNAME = "username"
 
-# Should the transcription run as fast as possible for local files or treat them as a livestream
+# Should the transcription run as fast as possible for local files or process them in realtime
 PROCESS_FAST = false 
+
+# Should the automatic question checker pipeline be active
+ENABLE_QUESTION_CHECKER = true
 
 # Should questions be sent to gemini automatically
 ENABLE_QA = true
@@ -40,3 +43,6 @@ FILTER_SHORT_QUESTIONS = false
 
 # Message is a short question if it has <= this many words
 SHORT_QUESTION_THRESHOLD = 2
+
+# Length of unsorted buffer in memory in seconds
+LOG_BUFFER_DELAY = 20

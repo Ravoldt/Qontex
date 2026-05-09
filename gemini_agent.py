@@ -4,21 +4,23 @@ import re
 import threading
 
 import cv2
-import google.generativeai as genai
+from google import genai
 import PIL.Image
 
 from utils import Message, log_json, shared_deque, get_streamer_name
 
 
 class GeminiAgent:
-    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-3-flash-preview")
+    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False, streamer_name="the streamer", log_answers_separately=False):
+        client = genai.Client(api_key=api_key)
+        self.model = ("gemini-1.5-flash-latest")
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
+        self.streamer_name = streamer_name
         self.qa_context_window = qa_context_window
         self.enable_visual_context = enable_visual_context
+        self.log_answers_separately = log_answers_separately
         self.item_duplicate_window_seconds = 240
         self._item_lock = threading.Lock()
         self._seen_item_events = []
@@ -31,8 +33,20 @@ class GeminiAgent:
         if game_name:
             self.game_name = game_name
 
-    def ask_gemini(self, username, question, source_type="chat", timestamp=None, video_frames_deque=None):
-        msg_time = timestamp if timestamp is not None else self._current_timestamp()
+    def ask_gemini(self, username: str, question: str, source_type: str = "chat", timestamp: float = None, video_frames_deque = None):
+        """
+        Sends a user's question to the Gemini model along with relevant stream context to generate an answer.
+
+        Args:
+            username: The name of the user asking the question.
+            question: The question text to be answered.
+            source_type: The origin of the question (e.g., "chat" or "transcript").
+            timestamp: The stream time the question was asked. Defaults to the current stream time.
+            video_frames_deque: A deque containing recent video frames for visual context.
+        """
+        
+        # Add a 1ms offset so it stably sorts immediately after the original question
+        msg_time = (timestamp + 0.001) if timestamp is not None else self._current_timestamp()
         
         all_messages = shared_deque.get_recent()
         context_msgs = [
@@ -42,10 +56,8 @@ class GeminiAgent:
         context_str = "\n".join(context_msgs) if context_msgs else "No recent context available."
 
         prompt = f"""
-        You are an AI assistant. 
-        Read the provided transcript from a {self.game_name} stream by {get_streamer_name}, then answer the specific target question.
-        Do not answer any other questions found in the transcript. 
-        If you do not have enough context to answer, or the question doesn't have an objective factual answer return exactly: NO_ANSWER
+        Answer the target question from {self.streamer_name}'s {self.game_name} stream.
+        If the question doesn't have an objective answer return exactly: NO_ANSWER
         If answering, write one concise sentence or short paragraph that can be understood without seeing the original question.
         Do not include labels, markdown, apologies, caveats, or additional commentary.
 
@@ -58,9 +70,8 @@ Target Question from '{username}':
         contents = [prompt]
 
         if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
-            frames = list(video_frames_deque)
-            step = max(1, len(frames) // 5)
-            for frame in frames[::step][:5]:
+            frames = list(video_frames_deque)[-int(self.qa_context_window):]
+            for frame in frames:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
@@ -82,6 +93,59 @@ Target Question from '{username}':
             )
             print(gemini_msg)
             log_json(self.log_folder, "merged.json", gemini_msg.to_dict())
+            if self.log_answers_separately:
+                log_json(self.log_folder, "answered_questions.json", gemini_msg.to_dict())
+            return answer
+        except Exception as e:
+            print(f"\nGemini API Error: {e}\n")
+            return None
+
+    def direct_ask(self, question, timestamp=None, video_frames_deque=None):
+        # Add a 1ms offset for stable sorting
+        msg_time = (timestamp + 0.001) if timestamp is not None else self._current_timestamp()
+        
+        all_messages = shared_deque.get_recent()
+        context_msgs = [
+            str(m) for m in all_messages
+            if abs(msg_time - m.timestamp) <= self.qa_context_window
+        ]
+        context_str = "\n".join(context_msgs) if context_msgs else "No recent context available."
+
+        prompt = f"""
+        One of {self.streamer_name}'s viewers has a question: {question}.
+        Answer the question. Below is recent context from the stream that may help you answer.
+
+Context:
+{context_str}
+"""
+
+        contents = [prompt]
+
+        if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
+            frames = list(video_frames_deque)
+            step = max(1, len(frames) // 5)
+            for frame in frames[::step][:5]:
+                rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = PIL.Image.fromarray(rgb_f)
+                contents.append(img)
+
+        try:
+            response = self.model.generate_content(contents)
+            answer = response.text.strip()
+            
+            print(f"\n[Gemini Console Response]:\n{answer}\n")
+            
+            gemini_msg = Message(
+                msg_time,
+                "gemini",
+                answer,
+                user="GEMINI",
+                question=question,
+                question_user="Console",
+                question_source="console",
+            )
+            log_json(self.log_folder, "merged.json", gemini_msg.to_dict())
+            
             return answer
         except Exception as e:
             print(f"\nGemini API Error: {e}\n")

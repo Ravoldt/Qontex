@@ -10,3 +10,6 @@ __pycache__/
 local.toml
 .tio.tokens.json
 dev/
+downloader.py
+.venv/
+venv/

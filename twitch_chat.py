@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import os
 import time
 import threading
@@ -170,6 +171,145 @@ class TwitchChatListener(commands.Bot):
         except Exception as e:
             print(f"\r[!] Twitch stream info lookup failed: {e}")
         return None, None
+
+
+class LocalChatListener:
+    def __init__(self, json_path, log_folder, question_handler=None, process_fast=False):
+        self.json_path = json_path
+        self.log_folder = log_folder
+        self.question_handler = question_handler
+        self.process_fast = process_fast
+        self.messages = []
+        self._stop_event = threading.Event()
+        self.question_queue = []
+        self.streamer_name = None
+        self.streamer_login = None
+        self.stream_start_date = None
+        self._load_messages()
+        
+        import streamcapture
+        if self.messages:
+            streamcapture.chat_processing_timestamp = self.messages[0]["timestamp"]
+        else:
+            streamcapture.chat_processing_timestamp = float('inf')
+
+    def _load_messages(self):
+        try:
+            with open(self.json_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:
+                    return
+                
+                # Check if it's JSON lines
+                if content.startswith('{') and '\n' in content:
+                    lines = content.split('\n')
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if not self.stream_start_date and "created_at" in data:
+                                try:
+                                    dt_str = data["created_at"].replace("Z", "").split(".")[0]
+                                    self.stream_start_date = datetime.datetime.fromisoformat(dt_str)
+                                except Exception:
+                                    pass
+                            ts = data.get("timestamp", data.get("content_offset_seconds", 0))
+                            user = data.get("user", data.get("commenter", {}).get("name", "unknown"))
+                            text = data.get("text", data.get("message", {}).get("body", ""))
+                            if "type" in data and data.get("type") != "chat":
+                                continue
+                            if text:
+                                self.messages.append({"timestamp": float(ts), "user": user, "text": text})
+                        except:
+                            pass
+                else:
+                    # Try full JSON
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        if "streamer" in data and isinstance(data["streamer"], dict):
+                            self.streamer_name = data["streamer"].get("name")
+                            self.streamer_login = data["streamer"].get("login")
+                        elif "video" in data and isinstance(data["video"], dict):
+                            self.streamer_name = data["video"].get("user_name")
+                            self.streamer_login = data["video"].get("user_login")
+                            
+                        if "comments" in data:
+                            # TwitchDownloader format
+                            for comment in data["comments"]:
+                                if not self.stream_start_date and "created_at" in comment:
+                                    try:
+                                        dt_str = comment["created_at"].replace("Z", "").split(".")[0]
+                                        self.stream_start_date = datetime.datetime.fromisoformat(dt_str)
+                                    except Exception:
+                                        pass
+                                ts = comment.get("content_offset_seconds", 0)
+                                user = comment.get("commenter", {}).get("name", "unknown")
+                                text = comment.get("message", {}).get("body", "")
+                                if text:
+                                    self.messages.append({"timestamp": float(ts), "user": user, "text": text})
+                    elif isinstance(data, list):
+                        for item in data:
+                            if not self.stream_start_date and "created_at" in item:
+                                try:
+                                    dt_str = item["created_at"].replace("Z", "").split(".")[0]
+                                    self.stream_start_date = datetime.datetime.fromisoformat(dt_str)
+                                except Exception:
+                                    pass
+                            ts = item.get("timestamp", item.get("content_offset_seconds", 0))
+                            user = item.get("user", item.get("commenter", {}).get("name", "unknown"))
+                            text = item.get("text", item.get("message", {}).get("body", ""))
+                            if "type" in item and item.get("type") != "chat":
+                                continue
+                            if text:
+                                self.messages.append({"timestamp": float(ts), "user": user, "text": text})
+                            
+            self.messages.sort(key=lambda x: x["timestamp"])
+        except Exception as e:
+            print(f"Error loading local chat JSON: {e}")
+
+    def listen(self):
+        import streamcapture
+        print(f"Loaded {len(self.messages)} chat messages from {self.json_path}")
+        msg_idx = 0
+        
+        try:
+            while not self._stop_event.is_set() and msg_idx < len(self.messages):
+                target_ts = self.messages[msg_idx]["timestamp"]
+                streamcapture.chat_processing_timestamp = target_ts
+                
+                current_ts = streamcapture.current_video_timestamp
+                
+                if current_ts < target_ts:
+                    time.sleep(0.01)
+                    continue
+                self._process_message(self.messages[msg_idx])
+                msg_idx += 1
+
+                if msg_idx < len(self.messages):
+                    streamcapture.chat_processing_timestamp = self.messages[msg_idx]["timestamp"]
+                else:
+                    streamcapture.chat_processing_timestamp = float('inf')
+        finally:
+            streamcapture.chat_processing_timestamp = float('inf')
+
+    def _process_message(self, msg_data):
+        msg = Message(msg_data["timestamp"], "chat", msg_data["text"], user=msg_data["user"])
+        print(f"\r{msg}")
+        log_message(self.log_folder, "chat.log", msg)
+        log_json(self.log_folder, "merged.json", msg.to_dict())
+        shared_deque.add_message(msg)
+        
+        should_detect_question = self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+        if should_detect_question and is_likely_question(msg.text, msg.type):
+            self.question_queue.append({"user": msg.user, "msg": msg.text, "timestamp": msg.timestamp})
+            if len(self.question_queue) > 20:
+                self.question_queue.pop(0)
+            if self.question_handler:
+                threading.Thread(target=self.question_handler, args=(msg,), daemon=True).start()
+                    
+    def stop(self):
+        self._stop_event.set()
 
 
 if __name__ == "__main__":

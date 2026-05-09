@@ -13,6 +13,9 @@ import datetime
 # Exported so it can be set by main.py
 STREAM_START_TIME = None
 
+current_video_timestamp = 0.0
+chat_processing_timestamp = None
+
 # In-memory buffer for video frames. Capture stores one frame per second, matching SharedDeque's 3-minute window.
 video_frames = deque(maxlen=shared_deque.max_age)
 
@@ -88,33 +91,41 @@ def start_audio_capture(source, process_fast=False):
         print("Error: Streamlink is not installed or not in your system PATH.")
         return None, None
 
-def capture_video_frames(source_url, stop_event=None):
-    """Background thread to capture exactly one frame per second from the video stream."""
+def capture_video_frames(source_url, stop_event=None, target_fps=1.0):
+    """Background thread to capture a specific number of frames per second from the video stream."""
+    global video_frames
+    # Resize the deque to match the target FPS while keeping the 3-minute time window
+    video_frames = deque(maxlen=int(shared_deque.max_age * target_fps))
     cap = cv2.VideoCapture(source_url)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps <= 0:
         fps = 30.0
         
-    frame_interval = max(1, int(fps))
+    frame_interval = max(1, int(fps / target_fps))
     frame_count = 0
     
     while not (stop_event and stop_event.is_set()):
-        ret, frame = cap.read()
+        # Grab advances the stream without doing heavy pixel decoding
+        ret = cap.grab()
         if not ret:
             break
             
         if frame_count % frame_interval == 0:
-            video_frames.append(frame)
+            ret, frame = cap.retrieve() # Only decode the frame we are actually keeping
+            if ret:
+                video_frames.append(frame)
             
         frame_count += 1
         
     cap.release()
 
-def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None):
+def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None, transcript_user=None):
     """Main capture loop running as a background thread."""
     global STREAM_START_TIME, _whisper_model, _vad_model
-    transcript_user = get_streamer_name(source)
+    
+    if transcript_user is None:
+        transcript_user = get_streamer_name(source)
     
     if _whisper_model is None or _vad_model is None:
         preload_models()
@@ -126,9 +137,10 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     audio_process, m3u8_url = start_audio_capture(source, process_fast=process_fast)
     
     if audio_process:
-        target_url = m3u8_url if m3u8_url else source
-        video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event), daemon=True)
-        video_thread.start()
+        if not process_fast:
+            target_url = m3u8_url if m3u8_url else source
+            video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event), daemon=True)
+            video_thread.start()
         
         print("Audio stream captured! Running AI-VAD loop...")
         
@@ -139,7 +151,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             
             SPEECH_THRESHOLD = 0.5     # AI Confidence: 50% probability it is human speech
             MAX_SILENCE_CHUNKS = 30    # ~1.0 second of silence triggers the end of a sentence
-            MAX_CHUNK_LIMIT = 156      # ~5.0 seconds maximum chunk length (The Safety Valve)
+            MAX_CHUNK_LIMIT = 156      # ~5.0 seconds maximum chunk length 
             
             audio_buffer = []
             silence_counter = 0
@@ -150,13 +162,24 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             
             while not (stop_event and stop_event.is_set()):
                 in_bytes = audio_process.stdout.read(CHUNK_SIZE)
-                if not in_bytes:
+                if not in_bytes or len(in_bytes) < CHUNK_SIZE:
                     break 
 
                 if audio_start_time is None:
                     audio_start_time = time.time()
                     
                 total_chunks += 1
+
+                global current_video_timestamp
+                if STREAM_START_TIME is None or process_fast:
+                    current_video_timestamp = total_chunks * CHUNK_DURATION
+                else:
+                    current_video_timestamp = max(0.0, time.time() - STREAM_START_TIME)
+
+                global chat_processing_timestamp
+                if chat_processing_timestamp is not None:
+                    while current_video_timestamp > chat_processing_timestamp + 1.0 and not (stop_event and stop_event.is_set()):
+                        time.sleep(0.01)
 
                 audio_data = np.frombuffer(in_bytes, np.int16).astype(np.float32) / 32768.0
                 
@@ -177,7 +200,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                         full_audio = np.concatenate(audio_buffer)
                         
                         # vad_filter=False because our Silero loop already perfectly trimmed the dead air!
-                        segments, _ = model.transcribe(full_audio, beam_size=15, vad_filter=False)
+                        segments, _ = model.transcribe(full_audio, beam_size=1, vad_filter=False)
                         
                         chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
                         
@@ -202,6 +225,31 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                         audio_buffer = []
                         is_speaking = False
                         silence_counter = 0
+
+            # Flush and transcribe any remaining audio when the stream ends
+            if len(audio_buffer) > 0:
+                full_audio = np.concatenate(audio_buffer)
+                segments, _ = model.transcribe(full_audio, beam_size=1, vad_filter=False)
+                
+                chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
+                
+                for segment in segments:
+                    if STREAM_START_TIME is None or process_fast:
+                        msg_time = chunk_base_time + segment.start
+                    else:
+                        segment_wall_time = audio_start_time + chunk_base_time + segment.start
+                        msg_time = segment_wall_time - STREAM_START_TIME
+
+                    msg_time = max(0.0, msg_time)  
+                        
+                    msg = Message(msg_time, "transcript", segment.text.strip(), user=transcript_user)
+                    print(msg)
+                    log_message(log_folder, "transcript.log", msg)
+                    log_json(log_folder, "merged.json", msg.to_dict())
+                    shared_deque.add_message(msg)
+                    should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+                    if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
+                        threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
                 
         except Exception as e:
             print(f"Error in capture loop: {e}")

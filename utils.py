@@ -7,24 +7,34 @@ import urllib.parse
 from datetime import datetime, timedelta
 from collections import deque
 import threading
+import time
 from transformers import pipeline
+import tomllib
 
 _log_lock = threading.Lock()
 _config_lock = threading.Lock()
 _classifier = None
 _config = {}
 
-def load_config(path="config.json"):
-    """Load config from disk and update the shared runtime config."""
+def _read_toml(path):
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"Syntax error in '{path}': {e}")
+
+def load_config(path="config.toml", local_path="local.toml"):
+    """Load shared config, then overlay local machine-specific settings."""
     global _config
-    with open(path, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    config = _read_toml(path)
+    if local_path and os.path.exists(local_path):
+        config.update(_read_toml(local_path))
     with _config_lock:
         _config = config
     return config
 
-def reload_config(path="config.json"):
-    return load_config(path)
+def reload_config(path="config.toml", local_path="local.toml"):
+    return load_config(path, local_path)
 
 def get_config_value(key, default=None):
     with _config_lock:
@@ -65,8 +75,8 @@ class Message:
 
     def format_timestamp(self):
         """Format timestamp as [h:mm:ss]"""
-        td = timedelta(seconds=int(self.timestamp))
-        hours, remainder = divmod(td.seconds, 3600)
+        total_seconds = max(0, int(self.timestamp))
+        hours, remainder = divmod(total_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         return "[{}:{:02d}:{:02d}]".format(hours, minutes, seconds)
 
@@ -103,13 +113,70 @@ def log_message(folder, filename, message, mode='a'):
         with open(path, mode, encoding='utf-8') as f:
             f.write(str(message) + '\n')
 
+_json_buffer = []
+_buffer_lock = threading.Lock()
+_flush_thread = None
+_flush_stop_event = threading.Event()
+
+def start_buffer_flusher():
+    global _flush_thread
+    with _buffer_lock:
+        if _flush_thread is None or not _flush_thread.is_alive():
+            _flush_thread = threading.Thread(target=_flush_loop, daemon=True)
+            _flush_thread.start()
+
+def _flush_loop():
+    while not _flush_stop_event.is_set():
+        time.sleep(1)
+        flush_json_buffer(force=False)
+
+def flush_json_buffer(force=True):
+    global _json_buffer
+    delay = get_config_value("LOG_BUFFER_DELAY", 20)
+    now = time.time()
+    to_flush, kept = [], []
+    with _buffer_lock:
+        for item in _json_buffer:
+            if force or (now - item[3] >= delay):
+                to_flush.append(item)
+            else:
+                kept.append(item)
+        _json_buffer = kept
+    if not to_flush:
+        return
+    grouped = {}
+    for folder, filename, data, _ in to_flush:
+        grouped.setdefault((folder, filename), []).append(data)
+    
+    def safe_ts(x):
+        try:
+            return float(x.get("timestamp", 0) if x.get("timestamp") is not None else 0)
+        except (ValueError, TypeError):
+            return 0.0
+            
+    for (folder, filename), items in grouped.items():
+        items.sort(key=safe_ts)
+        path = os.path.join(folder, filename)
+        with _log_lock:
+            with open(path, "a", encoding='utf-8') as f:
+                for data in items:
+                    json.dump(data, f, ensure_ascii=False)
+                    f.write('\n')
+
 def log_json(folder, filename, data, mode='a'):
-    """Append data to JSON file (for merged timeline, list of dicts)."""
-    path = os.path.join(folder, filename)
-    with _log_lock:
-        with open(path, mode, encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False)
-            f.write('\n')
+    """Append data to JSON buffer to be sorted and written later."""
+    if mode != 'a':
+        path = os.path.join(folder, filename)
+        with _log_lock:
+            with open(path, mode, encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+                f.write('\n')
+        return
+        
+    with _buffer_lock:
+        _json_buffer.append((folder, filename, data, time.time()))
+    if _flush_thread is None:
+        start_buffer_flusher()
 
 def preload_classifier():
     global _classifier
@@ -118,14 +185,18 @@ def preload_classifier():
         from transformers import pipeline
         device = 0 if torch.cuda.is_available() else -1
         print(f"Loading Question Classifier into {'VRAM' if device == 0 else 'RAM'}...")        
+        torch_dtype = torch.float16 if device == 0 else torch.float32
         _classifier = pipeline(
-            "text-classification", 
-            model="shahrukhx01/question-vs-statement-classifier", 
-            device=device
-        )
+            "zero-shot-classification",
+            model="valhalla/distilbart-mnli-12-3",
+            device=device,
+            torch_dtype=torch_dtype)
 
 def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
+    if not get_config_value("ENABLE_QUESTION_CHECKER", True):
+        return False
+        
     global _classifier
     
     clean_message = message.strip()
@@ -152,15 +223,15 @@ def is_likely_question(message, msg_type="chat"):
         return False
 
     # Fast Exits
-    if message_lower.endswith("?"):
-        _log_question_detection(message, msg_type, "question mark")
-        return True
-    if message_lower.endswith("..."):
-        return False
+    #if message_lower.endswith("?"):
+    #    _log_question_detection(message, msg_type, "question mark")
+    #    return True
+    #if message_lower.endswith("..."):
+    #    return False
 
     # Common question starters
     question_starters = (
-        "who ", "what ", "where ", "when ", "why ", "how ", 
+        #"who ", "what ", "where ", "when ", "why ", "how ", 
         "is there ", "are there ", "can i ", "do you ", "did you ", "have you ", "does he ", "what's ", "who's ", "where's ", "when's ", "why's ", "how's ",
         "is it ", "are they ", "could i ", "i wonder if ", "anyone know ", "can anyone ", "does anyone ", "would anyone ", "should i ", "am i "
     )
@@ -193,16 +264,13 @@ def is_likely_question(message, msg_type="chat"):
     if _classifier is None:
         preload_classifier()
 
-    results = _classifier(clean_message, top_k=None)
-    predictions = results[0] if results and isinstance(results[0], list) else results
-
-    question_score = 0.0
-    for prediction in predictions:
-        if prediction['label'].lower() in ["question", "label_1"]:
-            question_score = prediction['score']
-            break
-            
-    is_question = question_score >= 0.50
+    # classify on answerability
+    labels = ["information request", "reaction or exclamation", "statement"]
+    result = _classifier(clean_message, candidate_labels=labels)
+    
+    top_label = result["labels"][0]
+    question_score = result["scores"][0]
+    is_question = top_label == "information request" and question_score >= 0.60
     
     if is_question:
         _log_question_detection(message, msg_type, "AI classifier", question_score)
@@ -286,7 +354,7 @@ def refresh_twitch_token():
         "client_secret": client_secret,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "scope": "chat:read"
+        "scope": "user:read:chat" #user:write:chat is not needed currently
     }).encode("utf-8")
 
     req = urllib.request.Request("https://id.twitch.tv/oauth2/token", data=data)
