@@ -196,7 +196,8 @@ def preload_classifier():
             "zero-shot-classification",
             model="valhalla/distilbart-mnli-12-3",
             device=device,
-            dtype=dtype)
+            dtype=dtype,
+            token=os.getenv("HF_TOKEN"))
 
 def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
