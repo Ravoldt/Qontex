@@ -35,6 +35,19 @@ QA_CONTEXT_WINDOW = 60
 # Setting this to true will greatly increase api token usage!
 ENABLE_VISUAL_CONTEXT = false
 
+# The maximum number of frames to send to gemini for visual context
+VISUAL_CONTEXT_MAX_FRAMES = 5
+
+# The framerate to capture the video stream at (frames per second)
+VISUAL_CONTEXT_FPS = 1.0
+
+# Should audio data from the stream be included in the context sent to gemini
+# Setting this to true will increase api token usage!
+ENABLE_AUDIO_CONTEXT = false
+
+# The length of the audio buffer sent to gemini (in seconds)
+AUDIO_CONTEXT_WINDOW = 60
+
 # Should the script declare when a new question is detected
 LOG_QUESTION_DETECTIONS = true
 

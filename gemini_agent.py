@@ -1,17 +1,20 @@
+import io
 import json
 import os
 import re
 import threading
+import wave
 
 import cv2
 from google import genai
+from google.genai import types
 import PIL.Image
 
 from utils import Message, log_json, shared_deque, get_streamer_name
 
 
 class GeminiAgent:
-    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, enable_visual_context=False, streamer_name="the streamer", log_answers_separately=False):
+    def __init__(self, api_key, log_folder, start_time_ref=None, game_name=None, qa_context_window=60, audio_context_window=60, visual_context_max_frames=5, visual_context_fps=1.0, enable_visual_context=False, enable_audio_context=False, streamer_name="the streamer", log_answers_separately=False):
         self.client = genai.Client(api_key=api_key)
         self.model_name = "gemini-2.5-flash"
         self.log_folder = log_folder
@@ -20,6 +23,10 @@ class GeminiAgent:
         self.streamer_name = streamer_name
         self.qa_context_window = qa_context_window
         self.enable_visual_context = enable_visual_context
+        self.enable_audio_context = enable_audio_context
+        self.audio_context_window = audio_context_window
+        self.visual_context_max_frames = visual_context_max_frames
+        self.visual_context_fps = visual_context_fps
         self.log_answers_separately = log_answers_separately
         self.item_duplicate_window_seconds = 240
         self._item_lock = threading.Lock()
@@ -33,7 +40,7 @@ class GeminiAgent:
         if game_name:
             self.game_name = game_name
 
-    def ask_gemini(self, username: str, question: str, source_type: str = "chat", timestamp: float = None, video_frames_deque = None):
+    def ask_gemini(self, username: str, question: str, source_type: str = "chat", timestamp: float = None, video_frames_deque = None, audio_chunks_deque = None):
         """
         Sends a user's question to the Gemini model along with relevant stream context to generate an answer.
 
@@ -43,6 +50,7 @@ class GeminiAgent:
             source_type: The origin of the question (e.g., "chat" or "transcript").
             timestamp: The stream time the question was asked. Defaults to the current stream time.
             video_frames_deque: A deque containing recent video frames for visual context.
+            audio_chunks_deque: A deque containing recent audio chunks for audio context.
         """
         
         # Add a 1ms offset so it stably sorts immediately after the original question
@@ -56,7 +64,9 @@ class GeminiAgent:
         context_str = "\n".join(context_msgs) if context_msgs else "No recent context available."
 
         prompt = f"""
-        Answer the target question from {self.streamer_name}'s {self.game_name} stream.
+        Answer the target question from {self.streamer_name}'s '{self.game_name}' stream.
+        Please use Google Search to find the most accurate and up-to-date answer if the answer cannot be found in the context.
+        Use the provided stream context, video frames, and audio context as supplemental information to help understand what the user is referring to.
         If the question doesn't have an objective answer return exactly: NO_ANSWER
         If answering, write one concise sentence or short paragraph that can be understood without seeing the original question.
         Do not include labels, markdown, apologies, caveats, or additional commentary.
@@ -70,15 +80,33 @@ Target Question from '{username}':
         contents = [prompt]
 
         if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
-            frames = list(video_frames_deque)[-int(self.qa_context_window):]
-            step = max(1, len(frames) // 5)
-            for frame in frames[::step][:5]:
+            frames_to_slice = max(1, int(self.qa_context_window * self.visual_context_fps))
+            frames = list(video_frames_deque)[-frames_to_slice:]
+            step = max(1, len(frames) // max(1, self.visual_context_max_frames))
+            for frame in frames[::step][:self.visual_context_max_frames]:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
+                
+        if self.enable_audio_context and audio_chunks_deque and len(audio_chunks_deque) > 0:
+            num_chunks = max(1, int(self.audio_context_window / 0.032))
+            recent_audio = list(audio_chunks_deque)[-num_chunks:]
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"".join(recent_audio))
+            contents.append(types.Part.from_bytes(data=wav_io.getvalue(), mime_type="audio/wav"))
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=contents)
+            response = self.client.models.generate_content(
+                model=self.model_name, 
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=[{"google_search": {}}]
+                )
+            )
             answer = response.text.strip()            
             if not answer or answer == "NO_ANSWER":
                 return None
@@ -101,7 +129,7 @@ Target Question from '{username}':
             print(f"\nGemini API Error: {e}\n")
             return None
 
-    def direct_ask(self, question, timestamp=None, video_frames_deque=None):
+    def direct_ask(self, question, timestamp=None, video_frames_deque=None, audio_chunks_deque=None):
         # Add a 1ms offset for stable sorting
         msg_time = (timestamp + 0.001) if timestamp is not None else self._current_timestamp()
         
@@ -114,8 +142,8 @@ Target Question from '{username}':
 
         prompt = f"""
         One of {self.streamer_name}'s viewers has a question: {question}.
-        Answer the question. Below is recent context from the stream that may help you answer.
-        Use the provided video frames as visual context to help answer the question.
+        Answer the question by using Google Search to find the most accurate and up-to-date answer.
+        Below is recent context from the stream. Use this context along with any provided video or audio as supplemental information to help answer the question.
 
 Context:
 {context_str}
@@ -125,16 +153,33 @@ Context:
 
         if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
             frames = list(video_frames_deque)
-            step = max(1, len(frames) // 5)
-            for frame in frames[::step][:5]:
+            step = max(1, len(frames) // max(1, self.visual_context_max_frames))
+            for frame in frames[::step][:self.visual_context_max_frames]:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
                 
             print(f"[*] Attached {len(contents) - 1} video frames to Gemini direct ask.")
+            
+        if self.enable_audio_context and audio_chunks_deque and len(audio_chunks_deque) > 0:
+            num_chunks = max(1, int(self.audio_context_window / 0.032))
+            recent_audio = list(audio_chunks_deque)[-num_chunks:]
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"".join(recent_audio))
+            contents.append(types.Part.from_bytes(data=wav_io.getvalue(), mime_type="audio/wav"))
 
         try:
-            response = self.client.models.generate_content(model=self.model_name, contents=contents)
+            response = self.client.models.generate_content(
+                model=self.model_name, 
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    tools=[{"google_search": {}}]
+                )
+            )
             answer = response.text.strip()
             
             print(f"\n[Gemini Console Response]:\n{answer}\n")
@@ -155,7 +200,7 @@ Context:
             print(f"\nGemini API Error: {e}\n")
             return None
 
-    def process_items(self, video_frames_deque=None):
+    def process_items(self, video_frames_deque=None, audio_chunks_deque=None):
         messages = shared_deque.get_recent()
         if not messages:
             return
@@ -188,11 +233,22 @@ Context:
 
         if self.enable_visual_context and video_frames_deque and len(video_frames_deque) > 0:
             frames = list(video_frames_deque)
-            step = max(1, len(frames) // 5)
-            for frame in frames[::step][:5]:
+            step = max(1, len(frames) // max(1, self.visual_context_max_frames))
+            for frame in frames[::step][:self.visual_context_max_frames]:
                 rgb_f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 img = PIL.Image.fromarray(rgb_f)
                 contents.append(img)
+                
+        if self.enable_audio_context and audio_chunks_deque and len(audio_chunks_deque) > 0:
+            num_chunks = max(1, int(self.audio_context_window / 0.032))
+            recent_audio = list(audio_chunks_deque)[-num_chunks:]
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"".join(recent_audio))
+            contents.append(types.Part.from_bytes(data=wav_io.getvalue(), mime_type="audio/wav"))
 
         try:
             response = self.client.models.generate_content(model=self.model_name, contents=contents)

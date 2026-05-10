@@ -26,9 +26,15 @@ def _read_toml(path):
 def load_config(path="config.toml", local_path="local.toml"):
     """Load shared config, then overlay local machine-specific settings."""
     global _config
-    config = _read_toml(path)
+    
+    # Normalize keys to uppercase to prevent case-sensitivity issues across config files
+    raw_config = _read_toml(path)
+    config = {k.upper(): v for k, v in raw_config.items()}
+    
     if local_path and os.path.exists(local_path):
-        config.update(_read_toml(local_path))
+        local_raw = _read_toml(local_path)
+        config.update({k.upper(): v for k, v in local_raw.items()})
+        
     with _config_lock:
         _config = config
     return config
@@ -185,12 +191,12 @@ def preload_classifier():
         from transformers import pipeline
         device = 0 if torch.cuda.is_available() else -1
         print(f"Loading Question Classifier into {'VRAM' if device == 0 else 'RAM'}...")        
-        torch_dtype = torch.float16 if device == 0 else torch.float32
+        dtype = torch.float16 if device == 0 else torch.float32
         _classifier = pipeline(
             "zero-shot-classification",
             model="valhalla/distilbart-mnli-12-3",
             device=device,
-            torch_dtype=torch_dtype)
+            dtype=dtype)
 
 def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
@@ -211,9 +217,22 @@ def is_likely_question(message, msg_type="chat"):
         
     message_lower = clean_message.lower()
 
+    words = message_lower.split()
+
+    # Length filter for chat only
+    if msg_type == "chat":        
+        filter_short = get_config_value("FILTER_SHORT_QUESTIONS", True)
+        threshold = get_config_value("SHORT_QUESTION_THRESHOLD", 2)
+        if filter_short and len(words) <= threshold:
+            return False
+
+        # The Backseater Bypass, Drop long paragraphs without question marks
+        if len(words) > 15 and "?" not in message:
+            return False
+
     # Statements that look like questions but usually aren't
     looks_like_question_starters = (
-        "what a ", "what an ", "how nice", "how cool", "how cute", "how i",
+        "what a ", "what" "what an ", "how nice", "how cool", "how cute", "how i",
         "where i", "when i", "when you", "where you", "why i", "why you"
     )
     if any(
@@ -223,11 +242,11 @@ def is_likely_question(message, msg_type="chat"):
         return False
 
     # Fast Exits
-    #if message_lower.endswith("?"):
-    #    _log_question_detection(message, msg_type, "question mark")
-    #    return True
-    #if message_lower.endswith("..."):
-    #    return False
+    if message_lower.endswith("?"):
+        _log_question_detection(message, msg_type, "question mark")
+        return True
+    if message_lower.endswith("..."):
+        return False
 
     # Common question starters
     question_starters = (
@@ -246,19 +265,6 @@ def is_likely_question(message, msg_type="chat"):
     if matched_starter:
         _log_question_detection(message, msg_type, "starter phrase", detail=matched_starter)
         return True
-
-    words = message_lower.split()
-
-    # Length filter for chat only
-    if msg_type == "chat":        
-        filter_short = get_config_value("FILTER_SHORT_QUESTIONS", True)
-        threshold = get_config_value("SHORT_QUESTION_THRESHOLD", 2)
-        if filter_short and len(words) <= threshold:
-            return False
-
-        # The Backseater Bypass, Drop long paragraphs without question marks
-        if len(words) > 15 and "?" not in message:
-            return False
 
     # AI Classification
     if _classifier is None:

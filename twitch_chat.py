@@ -33,6 +33,7 @@ class TwitchChatListener(commands.Bot):
         self.stream_category = None
         self._fallback_start = time.time()
         self._info_loop_started = False
+        self._info_task = None
         self._event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._event_loop)
 
@@ -94,6 +95,8 @@ class TwitchChatListener(commands.Bot):
 
     def stop(self):
         if self._event_loop.is_running():
+            if getattr(self, '_info_task', None) and not self._info_task.done():
+                self._event_loop.call_soon_threadsafe(self._info_task.cancel)
             self._event_loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
 
     async def event_ready(self):
@@ -116,7 +119,7 @@ class TwitchChatListener(commands.Bot):
         
         if not self._info_loop_started:
             self._info_loop_started = True
-            asyncio.create_task(self.refresh_stream_info_loop())
+            self._info_task = asyncio.create_task(self.refresh_stream_info_loop())
 
     async def event_message(self, message):  # Changed parameter to 'message' for consistency with twitchio
         author = getattr(message, "author", None) or getattr(message, "chatter", None)
@@ -139,9 +142,12 @@ class TwitchChatListener(commands.Bot):
             self.handle_question(msg)
 
     async def refresh_stream_info_loop(self):
-        while True:
-            await self.refresh_stream_info()
-            await asyncio.sleep(300)
+        try:
+            while True:
+                await self.refresh_stream_info()
+                await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            pass
 
     async def refresh_stream_info(self):
         category, started_at = await self.fetch_stream_info()

@@ -19,6 +19,9 @@ chat_processing_timestamp = None
 # In-memory buffer for video frames. Capture stores one frame per second, matching SharedDeque's 3-minute window.
 video_frames = deque(maxlen=shared_deque.max_age)
 
+# In-memory buffer for audio chunks (32ms each). Matches 3-minute window.
+audio_chunks = deque(maxlen=int(shared_deque.max_age / 0.032))
+
 _whisper_model = None
 _vad_model = None
 
@@ -120,7 +123,7 @@ def capture_video_frames(source_url, stop_event=None, target_fps=1.0):
         
     cap.release()
 
-def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None, transcript_user=None):
+def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None, transcript_user=None, target_fps=1.0):
     """Main capture loop running as a background thread."""
     global STREAM_START_TIME, _whisper_model, _vad_model
     
@@ -139,7 +142,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     if audio_process:
         if not process_fast:
             target_url = m3u8_url if m3u8_url else source
-            video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event), daemon=True)
+            video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event, target_fps), daemon=True)
             video_thread.start()
         
         print("Audio stream captured! Running AI-VAD loop...")
@@ -164,6 +167,8 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                 in_bytes = audio_process.stdout.read(CHUNK_SIZE)
                 if not in_bytes or len(in_bytes) < CHUNK_SIZE:
                     break 
+
+                audio_chunks.append(in_bytes)
 
                 if audio_start_time is None:
                     audio_start_time = time.time()
@@ -200,7 +205,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                         full_audio = np.concatenate(audio_buffer)
                         
                         # vad_filter=False because our Silero loop already perfectly trimmed the dead air!
-                        segments, _ = model.transcribe(full_audio, beam_size=1, vad_filter=False)
+                        segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
                         
                         chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
                         
@@ -229,7 +234,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             # Flush and transcribe any remaining audio when the stream ends
             if len(audio_buffer) > 0:
                 full_audio = np.concatenate(audio_buffer)
-                segments, _ = model.transcribe(full_audio, beam_size=1, vad_filter=False)
+                segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
                 
                 chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
                 

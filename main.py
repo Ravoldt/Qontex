@@ -46,6 +46,10 @@ def resolve_config(config):
         "ENABLE_QUESTION_DETECTOR": config.get("ENABLE_QUESTION_DETECTOR", True),
         "enable_items": config.get("ENABLE_ITEMS", True),
         "enable_visual_context": config.get("ENABLE_VISUAL_CONTEXT", False),
+        "enable_audio_context": config.get("ENABLE_AUDIO_CONTEXT", False),
+        "visual_context_max_frames": config.get("VISUAL_CONTEXT_MAX_FRAMES", 5),
+        "visual_context_fps": config.get("VISUAL_CONTEXT_FPS", 1.0),
+        "audio_context_window": config.get("AUDIO_CONTEXT_WINDOW", 60),
         "qa_context_window": config.get("QA_CONTEXT_WINDOW", 60),
         "log_answers_separately": config.get("LOG_ANSWERS_SEPARATELY", False),
     }
@@ -60,6 +64,7 @@ def apply_process_fast_safety(config):
         "enable_qa_transcript": False,
         "enable_items": False,
         "enable_visual_context": False,
+        "enable_audio_context": False,
     })
     return config
 
@@ -126,6 +131,7 @@ def main():
                 source_type=msg.type,
                 timestamp=msg.timestamp,
                 video_frames_deque=my_streamlink.video_frames,
+                audio_chunks_deque=my_streamlink.audio_chunks,
             )
 
     def update_stream_category(category):
@@ -168,6 +174,7 @@ def main():
             runtime_config["source"],
             log_folder,
             process_fast=runtime_config["process_fast"],
+            target_fps=runtime_config["visual_context_fps"]
         )
         return
 
@@ -193,6 +200,10 @@ def main():
             game_name=runtime_config["game_name"],
             qa_context_window=runtime_config["qa_context_window"],
             enable_visual_context=runtime_config["enable_visual_context"],
+            enable_audio_context=runtime_config["enable_audio_context"],
+            visual_context_max_frames=runtime_config["visual_context_max_frames"],
+            visual_context_fps=runtime_config["visual_context_fps"],
+            audio_context_window=runtime_config["audio_context_window"],
             streamer_name=runtime_config["stream_name"],
             log_answers_separately=runtime_config["log_answers_separately"],
         )
@@ -201,7 +212,10 @@ def main():
             while True:
                 time.sleep(30)
                 if runtime["enable_items"]:
-                    agent.process_items(video_frames_deque=my_streamlink.video_frames)
+                    agent.process_items(
+                        video_frames_deque=my_streamlink.video_frames,
+                        audio_chunks_deque=my_streamlink.audio_chunks
+                    )
 
         processor_thread = threading.Thread(target=item_processor, daemon=True)
         processor_thread.start()
@@ -239,6 +253,10 @@ def main():
             agent.log_folder = folder
             agent.qa_context_window = config["qa_context_window"]
             agent.enable_visual_context = config["enable_visual_context"]
+            agent.enable_audio_context = config["enable_audio_context"]
+            agent.visual_context_max_frames = config["visual_context_max_frames"]
+            agent.visual_context_fps = config["visual_context_fps"]
+            agent.audio_context_window = config["audio_context_window"]
             agent.set_game_name(config["game_name"])
             agent.streamer_name = config["stream_name"]
             agent.log_answers_separately = config["log_answers_separately"]
@@ -295,7 +313,7 @@ def main():
         capture_stop = threading.Event()
         capture_thread = threading.Thread(
             target=my_streamlink.run_capture_loop,
-            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop, transcript_user),
+            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop, transcript_user, config["visual_context_fps"]),
             daemon=True,
         )
         capture_thread.start()
@@ -330,7 +348,8 @@ def main():
                                 args=(question,),
                                 kwargs={
                                     "timestamp": get_msg_time(),
-                                    "video_frames_deque": my_streamlink.video_frames
+                                    "video_frames_deque": my_streamlink.video_frames,
+                                    "audio_chunks_deque": my_streamlink.audio_chunks
                                 },
                                 daemon=True
                             ).start()
@@ -354,19 +373,26 @@ def main():
                             val_str = f'"{val_str}"'
                             
                         try:
-                            config_path = "config.toml"
-                            with open(config_path, "r", encoding="utf-8") as f:
+                            target_path = "config.toml"
+                            local_path = "local.toml"
+                            
+                            if os.path.exists(local_path):
+                                with open(local_path, "r", encoding="utf-8") as f:
+                                    if re.search(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=", f.read()):
+                                        target_path = local_path
+                            
+                            with open(target_path, "r", encoding="utf-8") as f:
                                 content = f.read()
                             
-                            pattern = re.compile(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=.*$")
+                            pattern = re.compile(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=.*$")
                             if pattern.search(content):
                                 content = pattern.sub(f"{key} = {val_str}", content)
                             else:
                                 content = content.rstrip() + f"\n{key} = {val_str}\n"
                                 
-                            with open(config_path, "w", encoding="utf-8") as f:
+                            with open(target_path, "w", encoding="utf-8") as f:
                                 f.write(content)
-                            print(f"Updated {key} to {val_str} in {config_path}")
+                            print(f"Updated {key} to {val_str} in {target_path}")
                             cmd = "reload"
                         except Exception as e:
                             print(f"Failed to update config.toml: {e}")
@@ -446,14 +472,20 @@ def main():
                     or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
                     or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
                     or new_config["ENABLE_QUESTION_DETECTOR"] != old_config["ENABLE_QUESTION_DETECTOR"]
+                or new_config["visual_context_fps"] != old_config["visual_context_fps"]
                 )
 
                 if agent:
                     agent.qa_context_window = new_config["qa_context_window"]
                     agent.enable_visual_context = new_config["enable_visual_context"]
-                    agent.set_game_name(new_config["game_name"])
-                    agent.streamer_name = new_config["stream_name"]
-                    agent.log_answers_separately = new_config["log_answers_separately"]
+                    agent.enable_audio_context = new_config["enable_audio_context"]
+                agent.visual_context_max_frames = new_config["visual_context_max_frames"]
+                agent.visual_context_fps = new_config["visual_context_fps"]
+                agent.audio_context_window = new_config["audio_context_window"]
+                agent.set_game_name(new_config["game_name"])
+                agent.streamer_name = new_config["stream_name"]
+                agent.log_answers_separately = new_config["log_answers_separately"]
+                
                 runtime["enable_items"] = new_config["enable_items"]
 
                 if changed_capture:
@@ -463,6 +495,7 @@ def main():
                     if changed_channel:
                         shared_deque.clear()
                         my_streamlink.video_frames.clear()
+                        my_streamlink.audio_chunks.clear()
 
                     stream_start = datetime.datetime.now()
                     
