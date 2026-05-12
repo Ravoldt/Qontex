@@ -2,6 +2,14 @@
 # Can be a url, local file path, or simply the streamer's name
 CHANNEL = "channel"
 
+# Source mode: "auto", "livestream", or "vod"
+# "auto" treats local files as VODs and everything else as a livestream
+SOURCE_TYPE = "auto"
+
+# Optional offline chat JSON/JSONL file for VOD sources
+# If blank, Qontex looks for a .json file next to the video file
+CHAT_FILE = ""
+
 # The username for the account that generated the TWITCH_TOKEN in the .env
 # This setting requires a restart 
 TWITCH_USERNAME = "username"
@@ -12,8 +20,18 @@ PROCESS_FAST = false
 # Should questions be automatically detected
 ENABLE_QUESTION_DETECTOR = true
 
+# The pipeline to use for question detection ("standard" or "standalone")
+# The standalone pipeline must exist at dev/question_detection_pipeline.py
+QUESTION_DETECTOR_TYPE = "standard"
+
 # Should questions be sent to gemini automatically
 ENABLE_QA = true
+
+# QA backend: "gemini", "none", or a custom "module:ClassName" adapter
+QA_AGENT = "gemini"
+
+# Optional model name passed to the configured QA backend
+QA_MODEL = "gemini-3-flash-preview"
 
 # Should gemini's answers be kept in their own file 
 LOG_ANSWERS_SEPARATELY = true

@@ -1,86 +1,97 @@
-import threading
-import os
-import json
-import time
-import datetime
 import argparse
+import datetime
+import json
+import os
 import re
+import threading
+import time
+from dataclasses import replace
+
 from dotenv import load_dotenv
 
-from utils import create_stream_folder, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque, flush_json_buffer
+from qa_agent import create_qa_agent
+from stream_state import StreamConfig, StreamState
 from twitch_chat import TwitchChatListener
-from gemini_agent import GeminiAgent
+from utils import create_stream_folder, flush_json_buffer, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque
 import streamcapture as my_streamlink
 
+
 def resolve_config(config):
-    channel = config.get("CHANNEL")
-    if not channel:
-        raise ValueError("Please set the CHANNEL in config.toml!")
+    return StreamConfig.from_raw(config)
 
-    is_local_video = os.path.isfile(channel)
-    if not is_local_video:
-        if not channel.startswith("http") and ("/" in channel or "\\" in channel or "." in channel):
-            raise ValueError(f"Local video file not found, or invalid Twitch channel name: '{channel}'")
-            
-        if channel.startswith("http"):
-            source = channel.rstrip('/').split('/')[-1]
-            twitch_channel = f"#{source}"
-        else:
-            twitch_channel = channel if channel.startswith("#") else f"#{channel}"
-            source = twitch_channel.lstrip("#")
-    else:
-        twitch_channel = channel
-        source = channel
-
-    return {
-        "channel": twitch_channel,
-        "source": source,
-        "is_local_video": is_local_video,
-        "stream_name": source,
-        "game_name": config.get("GAME_NAME") or config.get("GAME") or source,
-        "twitch_username": config.get("TWITCH_USERNAME"),
-        "process_fast": config.get("PROCESS_FAST", False),
-        "enable_qa": config.get("ENABLE_QA", True),
-        "enable_qa_chat": config.get("ENABLE_QA_CHAT", True),
-        "enable_qa_transcript": config.get("ENABLE_QA_TRANSCRIPT", True),
-        "ENABLE_QUESTION_DETECTOR": config.get("ENABLE_QUESTION_DETECTOR", True),
-        "enable_items": config.get("ENABLE_ITEMS", True),
-        "enable_visual_context": config.get("ENABLE_VISUAL_CONTEXT", False),
-        "enable_audio_context": config.get("ENABLE_AUDIO_CONTEXT", False),
-        "visual_context_max_frames": config.get("VISUAL_CONTEXT_MAX_FRAMES", 5),
-        "visual_context_fps": config.get("VISUAL_CONTEXT_FPS", 1.0),
-        "audio_context_window": config.get("AUDIO_CONTEXT_WINDOW", 60),
-        "qa_context_window": config.get("QA_CONTEXT_WINDOW", 60),
-        "log_answers_separately": config.get("LOG_ANSWERS_SEPARATELY", False),
-    }
 
 def apply_process_fast_safety(config):
-    if not config["process_fast"]:
+    if not config.process_fast:
         return config
 
-    config.update({
-        "enable_qa": False,
-        "enable_qa_chat": False,
-        "enable_qa_transcript": False,
-        "enable_items": False,
-        "enable_visual_context": False,
-        "enable_audio_context": False,
-    })
-    return config
+    return replace(
+        config,
+        enable_qa=False,
+        enable_qa_chat=False,
+        enable_qa_transcript=False,
+        enable_items=False,
+        enable_visual_context=False,
+        enable_audio_context=False,
+    )
+
+
+def hydrate_source_metadata(config):
+    stream_start = datetime.datetime.now()
+    if not config.is_vod or not config.chat_path or not os.path.exists(config.chat_path):
+        return config, stream_start
+
+    from twitch_chat import LocalChatListener
+
+    temp_listener = LocalChatListener(
+        config.chat_path,
+        None,
+        process_fast=config.process_fast,
+        initialize_sync=False,
+    )
+    login_name = temp_listener.streamer_login or temp_listener.streamer_name
+    if login_name:
+        config = replace(config, stream_name=login_name)
+    if temp_listener.stream_start_date:
+        stream_start = temp_listener.stream_start_date
+    return config, stream_start
+
+
+def configure_agent(state, no_gemini=False, previous_config=None):
+    disabled = no_gemini or state.config.process_fast
+    provider_changed = previous_config is None or state.config.qa_agent != previous_config.qa_agent
+
+    if disabled:
+        state.agent = None
+        reason = "PROCESS_FAST is enabled" if state.config.process_fast else "--no-gemini flag used"
+        print(f"QA Agent is DISABLED ({reason}).")
+        return
+
+    if state.agent is not None and not provider_changed:
+        if hasattr(state.agent, "refresh_from_state"):
+            state.agent.refresh_from_state()
+        return
+
+    state.agent = create_qa_agent(state)
+    if state.agent is None:
+        print("QA Agent is DISABLED via QA_AGENT.")
+    else:
+        print(f"QA Agent loaded: {state.config.qa_agent}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Qontex Stream AI Agent")
     parser.add_argument("--test-chat", action="store_true", help="Run only the Twitch Chat module")
     parser.add_argument("--test-capture", action="store_true", help="Run only the Video/Audio Capture module")
-    parser.add_argument("--no-gemini", action="store_true", help="Run without sending context/questions to Gemini")
+    parser.add_argument("--no-gemini", action="store_true", help="Run without sending context/questions to the QA agent")
     args = parser.parse_args()
 
     load_dotenv()
     refresh_twitch_token()
-    
+
     try:
         config = load_config()
         runtime_config = apply_process_fast_safety(resolve_config(config))
+        runtime_config, stream_start = hydrate_source_metadata(runtime_config)
     except FileNotFoundError:
         print("CRITICAL ERROR: config.toml is missing!")
         exit(1)
@@ -88,329 +99,273 @@ def main():
         print(e)
         exit(1)
 
-    gemini_disabled = args.no_gemini or runtime_config["process_fast"]
-    api_key = os.getenv("GENAI_API_KEY")
-    if not api_key and not gemini_disabled:
-        print("CRITICAL ERROR: GENAI_API_KEY is missing! Please check your .env file.")
-        exit(1)
+    if runtime_config.process_fast:
+        print("PROCESS_FAST is enabled; QA, item processing, and visual/audio context are disabled.")
 
-    if runtime_config["process_fast"]:
-        print("PROCESS_FAST is enabled; Gemini QA, item processing, and visual context are disabled.")
-
-    stream_start = datetime.datetime.now()
-
-    if runtime_config["is_local_video"]:
-        chat_json_path = os.path.splitext(runtime_config["channel"])[0] + ".json"
-        if os.path.exists(chat_json_path):
-            from twitch_chat import LocalChatListener
-            temp_listener = LocalChatListener(chat_json_path, None, process_fast=runtime_config["process_fast"])
-            login_name = temp_listener.streamer_login or temp_listener.streamer_name
-            if login_name:
-                runtime_config["stream_name"] = login_name
-            if temp_listener.stream_start_date:
-                stream_start = temp_listener.stream_start_date
-
-    log_folder = create_stream_folder(runtime_config["stream_name"], stream_start)
+    log_folder = create_stream_folder(runtime_config.stream_name, stream_start)
     log_start_stop(log_folder, "start")
 
-    # Time reference for all modules
-    STREAM_START_TIME = time.time()
-    def get_msg_time():
-        return time.time() - STREAM_START_TIME
+    state = StreamState(
+        config=runtime_config,
+        log_folder=log_folder,
+        stream_start=stream_start,
+        timeline=shared_deque,
+    )
+    my_streamlink.STREAM_START_TIME = state.clock_start_wall
 
     def update_stream_start(ts):
-        nonlocal STREAM_START_TIME
-        STREAM_START_TIME = ts
-        my_streamlink.STREAM_START_TIME = ts
+        state.update_stream_start(ts)
+        my_streamlink.STREAM_START_TIME = state.clock_start_wall
 
     def answer_question(msg):
-        if agent:
-            agent.ask_gemini(
-                msg.user,
-                msg.text,
-                source_type=msg.type,
-                timestamp=msg.timestamp,
-                video_frames_deque=my_streamlink.video_frames,
-                audio_chunks_deque=my_streamlink.audio_chunks,
-            )
+        if state.agent and hasattr(state.agent, "answer_question"):
+            state.agent.answer_question(msg)
 
     def update_stream_category(category):
-        if agent:
-            agent.set_game_name(category)
+        if state.agent and hasattr(state.agent, "set_game_name"):
+            state.agent.set_game_name(category)
 
     print("\nPreloading AI models into VRAM... (This will pause the script until ready)")
     if not args.test_chat:
         my_streamlink.preload_models()
-        
+
     if not args.test_capture:
         from utils import preload_classifier
-        if runtime_config["ENABLE_QUESTION_DETECTOR"]:
+
+        if runtime_config.enable_question_detector:
             preload_classifier()
     print("All models successfully loaded!\n")
 
-    # If running specific tests
     if args.test_chat:
-        if runtime_config["is_local_video"]:
-            print("Cannot test Twitch chat with a local video file.")
+        if not runtime_config.is_livestream:
+            print("Cannot test Twitch chat with a VOD/offline source.")
             return
-        print(f"Running standalone Twitch Chat test for {runtime_config['channel']}")
-        PASS = os.getenv("TWITCH_TOKEN")
+        print(f"Running standalone Twitch Chat test for {runtime_config.channel}")
         listener = TwitchChatListener(
-            runtime_config["twitch_username"],
-            PASS,
-            runtime_config["channel"],
+            runtime_config.twitch_username,
+            os.getenv("TWITCH_TOKEN"),
+            runtime_config.channel,
             log_folder,
-            start_time_ref=get_msg_time,
             category_handler=lambda category: print(f"Using Twitch category: {category}"),
             stream_start_handler=update_stream_start,
+            state=state,
         )
         listener.listen()
         return
 
     if args.test_capture:
-        print(f"Running standalone Capture test for {runtime_config['source']}")
-        my_streamlink.STREAM_START_TIME = STREAM_START_TIME
+        print(f"Running standalone Capture test for {runtime_config.source}")
         my_streamlink.run_capture_loop(
-            runtime_config["source"],
+            runtime_config.source,
             log_folder,
-            process_fast=runtime_config["process_fast"],
-            target_fps=runtime_config["visual_context_fps"]
+            process_fast=runtime_config.process_fast,
+            target_fps=runtime_config.visual_context_fps,
+            state=state,
         )
         return
 
-    # Normal execution:
-    my_streamlink.STREAM_START_TIME = STREAM_START_TIME
+    try:
+        configure_agent(state, no_gemini=args.no_gemini)
+    except ValueError as e:
+        print(f"CRITICAL ERROR: {e}")
+        exit(1)
 
-    runtime = {
-        "config": runtime_config,
-        "log_folder": log_folder,
-        "chat_listener": None,
-        "listener_thread": None,
-        "capture_thread": None,
-        "capture_stop": None,
-        "enable_items": runtime_config["enable_items"],
-    }
+    def item_processor():
+        while True:
+            time.sleep(30)
+            process_items = getattr(state.agent, "process_items", None)
+            if state.enable_items and callable(process_items):
+                process_items()
 
-    agent = None
-    if not gemini_disabled:
-        agent = GeminiAgent(
-            api_key,
-            log_folder,
-            start_time_ref=get_msg_time,
-            game_name=runtime_config["game_name"],
-            qa_context_window=runtime_config["qa_context_window"],
-            enable_visual_context=runtime_config["enable_visual_context"],
-            enable_audio_context=runtime_config["enable_audio_context"],
-            visual_context_max_frames=runtime_config["visual_context_max_frames"],
-            visual_context_fps=runtime_config["visual_context_fps"],
-            audio_context_window=runtime_config["audio_context_window"],
-            streamer_name=runtime_config["stream_name"],
-            log_answers_separately=runtime_config["log_answers_separately"],
-        )
-
-        def item_processor():
-            while True:
-                time.sleep(30)
-                if runtime["enable_items"]:
-                    agent.process_items(
-                        video_frames_deque=my_streamlink.video_frames,
-                        audio_chunks_deque=my_streamlink.audio_chunks
-                    )
-
-        processor_thread = threading.Thread(target=item_processor, daemon=True)
-        processor_thread.start()
-        if not runtime_config["enable_items"]:
-            print("Gemini Item Processing is DISABLED via config.toml.")
-    else:
-        reason = "PROCESS_FAST is enabled" if runtime_config["process_fast"] else "--no-gemini flag used"
-        print(f"Gemini Agent is DISABLED ({reason}).")
+    processor_thread = threading.Thread(target=item_processor, daemon=True)
+    processor_thread.start()
+    if not runtime_config.enable_items:
+        print("Item Processing is DISABLED via config.toml.")
 
     def current_qa_handler(config):
-        return answer_question if (agent and config["enable_qa"]) else None
+        return answer_question if (state.agent and config.enable_qa) else None
 
     def stop_runtime():
-        if runtime["chat_listener"]:
-            runtime["chat_listener"].stop()
-            runtime["chat_listener"] = None
+        if state.chat_listener:
+            state.chat_listener.stop()
+            state.chat_listener = None
 
-        if runtime["capture_stop"]:
-            runtime["capture_stop"].set()
+        if state.capture_stop:
+            state.capture_stop.set()
 
-        if runtime["capture_thread"] and runtime["capture_thread"].is_alive():
-            runtime["capture_thread"].join(timeout=5)
+        if state.capture_thread and state.capture_thread.is_alive():
+            state.capture_thread.join(timeout=5)
 
-        runtime["capture_thread"] = None
-        runtime["capture_stop"] = None
+        state.capture_thread = None
+        state.capture_stop = None
 
         flush_json_buffer(force=True)
 
     def start_runtime(config, folder):
-        runtime["config"] = config
-        runtime["log_folder"] = folder
-        runtime["enable_items"] = config["enable_items"]
-
-        if agent:
-            agent.log_folder = folder
-            agent.qa_context_window = config["qa_context_window"]
-            agent.enable_visual_context = config["enable_visual_context"]
-            agent.enable_audio_context = config["enable_audio_context"]
-            agent.visual_context_max_frames = config["visual_context_max_frames"]
-            agent.visual_context_fps = config["visual_context_fps"]
-            agent.audio_context_window = config["audio_context_window"]
-            agent.set_game_name(config["game_name"])
-            agent.streamer_name = config["stream_name"]
-            agent.log_answers_separately = config["log_answers_separately"]
+        state.refresh_config(config, folder)
+        if state.agent and hasattr(state.agent, "refresh_from_state"):
+            state.agent.refresh_from_state()
 
         qa_handler = current_qa_handler(config)
-        qa_handler_chat = qa_handler if config["enable_qa_chat"] else None
-        qa_handler_transcript = qa_handler if config["enable_qa_transcript"] else None
-        PASS = os.getenv("TWITCH_TOKEN")
+        qa_handler_chat = qa_handler if config.enable_qa_chat else None
+        qa_handler_transcript = qa_handler if config.enable_qa_transcript else None
 
-        transcript_user = config["stream_name"]
+        transcript_user = config.stream_name
 
-        if not config["is_local_video"]:
+        if config.is_livestream:
             chat_listener = TwitchChatListener(
-                config["twitch_username"],
-                PASS,
-                config["channel"],
+                config.twitch_username,
+                os.getenv("TWITCH_TOKEN"),
+                config.channel,
                 folder,
-                start_time_ref=get_msg_time,
                 question_handler=qa_handler_chat,
                 category_handler=update_stream_category,
                 stream_start_handler=update_stream_start,
+                state=state,
             )
             listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
             listener_thread.start()
-            runtime["chat_listener"] = chat_listener
-            runtime["listener_thread"] = listener_thread
-            print(f"Connected to {config['channel']}. Listening for questions in the background...")
+            state.chat_listener = chat_listener
+            state.listener_thread = listener_thread
+            print(f"Connected to {config.channel}. Listening for questions in the background...")
         else:
-            chat_json_path = os.path.splitext(config["channel"])[0] + ".json"
-            if os.path.exists(chat_json_path):
+            chat_path = config.chat_path
+            if chat_path and os.path.exists(chat_path):
                 from twitch_chat import LocalChatListener
+
                 chat_listener = LocalChatListener(
-                    chat_json_path,
+                    chat_path,
                     folder,
                     question_handler=qa_handler_chat,
-                    process_fast=config["process_fast"]
+                    process_fast=config.process_fast,
+                    state=state,
                 )
                 login_name = chat_listener.streamer_login or chat_listener.streamer_name
                 if login_name:
                     transcript_user = login_name
-                    if agent:
-                        agent.streamer_name = login_name
+                    state.config = replace(state.config, stream_name=login_name)
+                    if state.agent and hasattr(state.agent, "streamer_name"):
+                        state.agent.streamer_name = login_name
 
                 listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
                 listener_thread.start()
-                runtime["chat_listener"] = chat_listener
-                runtime["listener_thread"] = listener_thread
-                print(f"Local video '{config['channel']}' detected. Found matching chat file: {chat_json_path}")
+                state.chat_listener = chat_listener
+                state.listener_thread = listener_thread
+                print(f"VOD source '{config.source}' detected. Using chat file: {chat_path}")
             else:
-                runtime["chat_listener"] = None
-                runtime["listener_thread"] = None
-                print(f"Local video '{config['channel']}' detected. Twitch chat listener is disabled. (No matching .json found)")
+                state.chat_listener = None
+                state.listener_thread = None
+                print(f"VOD source '{config.source}' detected. Offline chat is disabled. (No chat file found)")
 
         capture_stop = threading.Event()
         capture_thread = threading.Thread(
             target=my_streamlink.run_capture_loop,
-            args=(config["source"], folder, config["process_fast"], qa_handler_transcript, capture_stop, transcript_user, config["visual_context_fps"]),
+            args=(config.source, folder),
+            kwargs={
+                "process_fast": config.process_fast,
+                "question_handler": qa_handler_transcript,
+                "stop_event": capture_stop,
+                "transcript_user": transcript_user,
+                "target_fps": config.visual_context_fps,
+                "state": state,
+            },
             daemon=True,
         )
         capture_thread.start()
-        runtime["capture_stop"] = capture_stop
-        runtime["capture_thread"] = capture_thread
+        state.capture_stop = capture_stop
+        state.capture_thread = capture_thread
 
     start_runtime(runtime_config, log_folder)
-    
+
     try:
         while True:
             raw_cmd = input("Cmd (status, timeline, clear, reload, quit, /<config> <val>, /ask <q>)> ").strip()
             if not raw_cmd:
                 continue
-                
+
             cmd = raw_cmd.lower()
-            
+
             if raw_cmd.startswith("/"):
                 parts = raw_cmd[1:].split(maxsplit=1)
                 if not parts:
                     continue
                 command = parts[0].lower()
-                
+
                 if command == "ask":
                     if len(parts) > 1:
                         question = parts[1]
-                        if runtime["config"]["process_fast"]:
-                            print("Gemini Agent is DISABLED while PROCESS_FAST is enabled.")
-                        elif agent:
-                            print(f"Asking Gemini: {question}")
+                        if state.config.process_fast:
+                            print("QA Agent is DISABLED while PROCESS_FAST is enabled.")
+                        elif state.agent:
+                            print(f"Asking QA agent: {question}")
+                            direct_ask = getattr(state.agent, "direct_ask", None)
+                            if not callable(direct_ask):
+                                print("Configured QA agent does not implement direct_ask.")
+                                continue
                             threading.Thread(
-                                target=agent.direct_ask,
+                                target=direct_ask,
                                 args=(question,),
-                                kwargs={
-                                    "timestamp": get_msg_time(),
-                                    "video_frames_deque": my_streamlink.video_frames,
-                                    "audio_chunks_deque": my_streamlink.audio_chunks
-                                },
-                                daemon=True
+                                kwargs={"timestamp": state.current_timestamp()},
+                                daemon=True,
                             ).start()
                         else:
-                            print("Gemini Agent is DISABLED.")
+                            print("QA Agent is DISABLED.")
                     else:
                         print("Usage: /ask <question>")
                     continue
-                else:
-                    if len(parts) > 1:
-                        key = command.upper()
-                        val_str = parts[1].strip()
-                        
-                        if val_str.lower() == "true":
-                            val_str = "true"
-                        elif val_str.lower() == "false":
-                            val_str = "false"
-                        elif val_str.isdigit():
-                            pass
-                        elif not (val_str.startswith('"') and val_str.endswith('"')):
-                            val_str = f'"{val_str}"'
-                            
-                        try:
-                            target_path = "config.toml"
-                            local_path = "local.toml"
-                            
-                            if os.path.exists(local_path):
-                                with open(local_path, "r", encoding="utf-8") as f:
-                                    if re.search(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=", f.read()):
-                                        target_path = local_path
-                            
-                            with open(target_path, "r", encoding="utf-8") as f:
-                                content = f.read()
-                            
-                            pattern = re.compile(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=.*$")
-                            if pattern.search(content):
-                                content = pattern.sub(f"{key} = {val_str}", content)
-                            else:
-                                content = content.rstrip() + f"\n{key} = {val_str}\n"
-                                
-                            with open(target_path, "w", encoding="utf-8") as f:
-                                f.write(content)
-                            print(f"Updated {key} to {val_str} in {target_path}")
-                            cmd = "reload"
-                        except Exception as e:
-                            print(f"Failed to update config.toml: {e}")
-                            continue
-                    else:
-                        print(f"Usage: /{command} <value>")
+
+                if len(parts) > 1:
+                    key = command.upper()
+                    val_str = parts[1].strip()
+
+                    if val_str.lower() == "true":
+                        val_str = "true"
+                    elif val_str.lower() == "false":
+                        val_str = "false"
+                    elif val_str.isdigit():
+                        pass
+                    elif not (val_str.startswith('"') and val_str.endswith('"')):
+                        val_str = f'"{val_str}"'
+
+                    try:
+                        target_path = "config.toml"
+                        local_path = "local.toml"
+
+                        if os.path.exists(local_path):
+                            with open(local_path, "r", encoding="utf-8") as f:
+                                if re.search(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=", f.read()):
+                                    target_path = local_path
+
+                        with open(target_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+
+                        pattern = re.compile(rf"(?mi)^[ \t]*{re.escape(key)}[ \t]*=.*$")
+                        if pattern.search(content):
+                            content = pattern.sub(f"{key} = {val_str}", content)
+                        else:
+                            content = content.rstrip() + f"\n{key} = {val_str}\n"
+
+                        with open(target_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        print(f"Updated {key} to {val_str} in {target_path}")
+                        cmd = "reload"
+                    except Exception as e:
+                        print(f"Failed to update config.toml: {e}")
                         continue
-            
+                else:
+                    print(f"Usage: /{command} <value>")
+                    continue
+
             if cmd in ("status", "list"):
                 print("\n--- Status ---")
 
-                print(f"Gemini Agent: {'ACTIVE' if agent else 'OFFLINE'}")
-                print(f"Channel: {runtime['config']['channel']}")
-                print(f"Capture: {'ACTIVE' if runtime['capture_thread'] and runtime['capture_thread'].is_alive() else 'OFFLINE'}")
-                print(f"Chat Listener: {'ACTIVE' if runtime['chat_listener'] else 'OFFLINE'}")
-                
+                print(f"QA Agent: {'ACTIVE' if state.agent else 'OFFLINE'}")
+                print(f"Source: {state.config.source_kind} {state.config.source}")
+                print(f"Chat File: {state.config.chat_path or 'none'}")
+                print(f"Capture: {'ACTIVE' if state.capture_thread and state.capture_thread.is_alive() else 'OFFLINE'}")
+                print(f"Chat Listener: {'ACTIVE' if state.chat_listener else 'OFFLINE'}")
 
-                chat_listener = runtime["chat_listener"]
+                chat_listener = state.chat_listener
                 if not chat_listener or not chat_listener.question_queue:
                     print("Question queue is empty.")
                 else:
@@ -418,10 +373,9 @@ def main():
                     for i, q in enumerate(chat_listener.question_queue):
                         print(f"[{i}] {q['user']}: {q['msg']}")
                 print("--------------\n")
-                    
+
             elif cmd == "timeline":
-                log_path = os.path.join(runtime["log_folder"], "merged.json")
-                # Always force a flush of the latest buffer data before reading timeline
+                log_path = os.path.join(state.log_folder, "merged.json")
                 flush_json_buffer(force=True)
                 if os.path.exists(log_path):
                     try:
@@ -430,13 +384,12 @@ def main():
                             for line in f:
                                 if line.strip():
                                     try:
-                                        # Handle concurrent file writes gracefully
                                         lines.append(json.loads(line))
                                     except json.JSONDecodeError:
                                         continue
-                        
+
                         lines.sort(key=lambda x: x.get("timestamp", 0))
-                        
+
                         print("\n--- Chronological Timeline ---")
                         for entry in lines:
                             ts = max(0, int(entry.get("timestamp", 0)))
@@ -452,87 +405,82 @@ def main():
                     print("No merged.json found for the current session yet.\n")
 
             elif cmd == "clear":
-                if runtime["chat_listener"]:
-                    runtime["chat_listener"].question_queue.clear()
+                if state.chat_listener:
+                    state.chat_listener.question_queue.clear()
                 print("Queue cleared.\n")
 
             elif cmd == "reload":
                 try:
                     new_config = apply_process_fast_safety(resolve_config(reload_config()))
+                    new_config, new_stream_start = hydrate_source_metadata(new_config)
                 except Exception as e:
                     print(f"Config reload failed: {e}\n")
                     continue
 
-                old_config = runtime["config"]
-                changed_channel = new_config["source"] != old_config["source"]
+                old_config = state.config
+                changed_source = (
+                    new_config.source != old_config.source
+                    or new_config.source_kind != old_config.source_kind
+                    or new_config.chat_path != old_config.chat_path
+                )
                 changed_capture = (
-                    changed_channel
-                    or new_config["process_fast"] != old_config["process_fast"]
-                    or new_config["enable_qa"] != old_config["enable_qa"]
-                    or new_config["enable_qa_chat"] != old_config["enable_qa_chat"]
-                    or new_config["enable_qa_transcript"] != old_config["enable_qa_transcript"]
-                    or new_config["ENABLE_QUESTION_DETECTOR"] != old_config["ENABLE_QUESTION_DETECTOR"]
-                or new_config["visual_context_fps"] != old_config["visual_context_fps"]
+                    changed_source
+                    or new_config.process_fast != old_config.process_fast
+                    or new_config.enable_qa != old_config.enable_qa
+                    or new_config.enable_qa_chat != old_config.enable_qa_chat
+                    or new_config.enable_qa_transcript != old_config.enable_qa_transcript
+                    or new_config.enable_question_detector != old_config.enable_question_detector
+                    or new_config.question_detector_type != old_config.question_detector_type
+                    or new_config.enable_visual_context != old_config.enable_visual_context
+                    or new_config.visual_context_fps != old_config.visual_context_fps
                 )
 
-                if agent:
-                    agent.qa_context_window = new_config["qa_context_window"]
-                    agent.enable_visual_context = new_config["enable_visual_context"]
-                    agent.enable_audio_context = new_config["enable_audio_context"]
-                agent.visual_context_max_frames = new_config["visual_context_max_frames"]
-                agent.visual_context_fps = new_config["visual_context_fps"]
-                agent.audio_context_window = new_config["audio_context_window"]
-                agent.set_game_name(new_config["game_name"])
-                agent.streamer_name = new_config["stream_name"]
-                agent.log_answers_separately = new_config["log_answers_separately"]
-                
-                runtime["enable_items"] = new_config["enable_items"]
-
                 if changed_capture:
-                    uptime = time.time() - STREAM_START_TIME
-                    log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
+                    uptime = time.time() - state.clock_start_wall
+                    log_start_stop(state.log_folder, "stop", uptime=uptime)
                     stop_runtime()
-                    if changed_channel:
-                        shared_deque.clear()
+                    if changed_source:
+                        state.clear_buffers()
                         my_streamlink.video_frames.clear()
                         my_streamlink.audio_chunks.clear()
 
-                    stream_start = datetime.datetime.now()
-                    
-                    if new_config["is_local_video"]:
-                        chat_json_path = os.path.splitext(new_config["channel"])[0] + ".json"
-                        if os.path.exists(chat_json_path):
-                            from twitch_chat import LocalChatListener
-                            temp_listener = LocalChatListener(chat_json_path, None, process_fast=new_config["process_fast"])
-                            login_name = temp_listener.streamer_login or temp_listener.streamer_name
-                            if login_name:
-                                new_config["stream_name"] = login_name
-                            if temp_listener.stream_start_date:
-                                stream_start = temp_listener.stream_start_date
-
-                    new_log_folder = create_stream_folder(new_config["stream_name"], stream_start)
+                    new_log_folder = create_stream_folder(new_config.stream_name, new_stream_start)
                     log_start_stop(new_log_folder, "start")
+                    state.refresh_config(new_config, new_log_folder)
+                    state.stream_start = new_stream_start
+                    state.clock_start_wall = time.time()
+                    my_streamlink.STREAM_START_TIME = state.clock_start_wall
 
-                    STREAM_START_TIME = time.time()
-                    my_streamlink.STREAM_START_TIME = STREAM_START_TIME
+                    try:
+                        configure_agent(state, no_gemini=args.no_gemini, previous_config=old_config)
+                    except ValueError as e:
+                        print(f"QA agent reload failed: {e}")
+                        state.agent = None
+
                     start_runtime(new_config, new_log_folder)
-                    print(f"Reloaded config and restarted stream workers for {new_config['channel']}.\n")
+                    print(f"Reloaded config and restarted stream workers for {new_config.source}.\n")
                 else:
-                    runtime["config"] = new_config
+                    state.refresh_config(new_config)
+                    try:
+                        configure_agent(state, no_gemini=args.no_gemini, previous_config=old_config)
+                    except ValueError as e:
+                        print(f"QA agent reload failed: {e}")
+                        state.agent = None
                     print("Reloaded config without restarting stream workers.\n")
-                
+
             elif cmd == "quit":
-                uptime = time.time() - STREAM_START_TIME
-                log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
+                uptime = time.time() - state.clock_start_wall
+                log_start_stop(state.log_folder, "stop", uptime=uptime)
                 stop_runtime()
                 print("Shutting down...")
                 break
-                
+
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received. Shutting down...")
-        uptime = time.time() - STREAM_START_TIME
-        log_start_stop(runtime["log_folder"], "stop", uptime=uptime)
+        uptime = time.time() - state.clock_start_wall
+        log_start_stop(state.log_folder, "stop", uptime=uptime)
         stop_runtime()
+
 
 if __name__ == "__main__":
     main()

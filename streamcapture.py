@@ -45,7 +45,7 @@ def preload_models():
         _vad_model = _vad_model.to(device)
         _vad_model.eval()
 
-def start_audio_capture(source, process_fast=False):
+def start_audio_capture(source, process_fast=False, enable_video=None):
     """Starts a background process to extract audio from a video or livestream."""
     if not source.startswith("http") and "." not in source:
         source = f"https://www.twitch.tv/{source}"
@@ -61,8 +61,11 @@ def start_audio_capture(source, process_fast=False):
     if is_livestream:
         print(f"Resolving stream URL for {source}...")
         try:
+            if enable_video is None:
+                enable_video = get_config_value("ENABLE_VISUAL_CONTEXT", False)
+            quality = "best" if enable_video else "audio_only"
             m3u8_url = subprocess.check_output(
-                ["streamlink", "--stream-url", source, "audio_only"],
+                ["streamlink", "--stream-url", source, quality],
                 stderr=subprocess.STDOUT
             ).decode("utf-8").strip()
             command.extend(["-i", m3u8_url])
@@ -94,11 +97,15 @@ def start_audio_capture(source, process_fast=False):
         print("Error: Streamlink is not installed or not in your system PATH.")
         return None, None
 
-def capture_video_frames(source_url, stop_event=None, target_fps=1.0):
+def capture_video_frames(source_url, stop_event=None, target_fps=1.0, state=None):
     """Background thread to capture a specific number of frames per second from the video stream."""
     global video_frames
-    # Resize the deque to match the target FPS while keeping the 3-minute time window
-    video_frames = deque(maxlen=int(shared_deque.max_age * target_fps))
+    if state:
+        frame_buffer = state.configure_video_buffer(target_fps)
+    else:
+        # Resize the deque to match the target FPS while keeping the 3-minute time window
+        video_frames = deque(maxlen=int(shared_deque.max_age * target_fps))
+        frame_buffer = video_frames
     cap = cv2.VideoCapture(source_url)
     
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -117,18 +124,23 @@ def capture_video_frames(source_url, stop_event=None, target_fps=1.0):
         if frame_count % frame_interval == 0:
             ret, frame = cap.retrieve() # Only decode the frame we are actually keeping
             if ret:
-                video_frames.append(frame)
+                frame_buffer.append(frame)
             
         frame_count += 1
         
     cap.release()
 
-def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None, transcript_user=None, target_fps=1.0):
+def run_capture_loop(source, log_folder, process_fast=False, question_handler=None, stop_event=None, transcript_user=None, target_fps=1.0, state=None):
     """Main capture loop running as a background thread."""
     global STREAM_START_TIME, _whisper_model, _vad_model
-    
+
+    if state:
+        log_folder = state.log_folder
+        process_fast = state.config.process_fast
+        target_fps = state.config.visual_context_fps
+
     if transcript_user is None:
-        transcript_user = get_streamer_name(source)
+        transcript_user = state.config.stream_name if state else get_streamer_name(source)
     
     if _whisper_model is None or _vad_model is None:
         preload_models()
@@ -137,12 +149,13 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     vad_model = _vad_model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    audio_process, m3u8_url = start_audio_capture(source, process_fast=process_fast)
-    
+    enable_video = state.config.enable_visual_context if state else get_config_value("ENABLE_VISUAL_CONTEXT", False)
+    audio_process, m3u8_url = start_audio_capture(source, process_fast=process_fast, enable_video=enable_video)
+
     if audio_process:
-        if not process_fast:
+        if not process_fast and enable_video:
             target_url = m3u8_url if m3u8_url else source
-            video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event, target_fps), daemon=True)
+            video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event, target_fps, state), daemon=True)
             video_thread.start()
         
         print("Audio stream captured! Running AI-VAD loop...")
@@ -168,7 +181,10 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                 if not in_bytes or len(in_bytes) < CHUNK_SIZE:
                     break 
 
-                audio_chunks.append(in_bytes)
+                if state:
+                    state.audio_chunks.append(in_bytes)
+                else:
+                    audio_chunks.append(in_bytes)
 
                 if audio_start_time is None:
                     audio_start_time = time.time()
@@ -180,11 +196,15 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                     current_video_timestamp = total_chunks * CHUNK_DURATION
                 else:
                     current_video_timestamp = max(0.0, time.time() - STREAM_START_TIME)
+                if state:
+                    state.current_video_timestamp = current_video_timestamp
 
                 global chat_processing_timestamp
-                if chat_processing_timestamp is not None:
-                    while current_video_timestamp > chat_processing_timestamp + 1.0 and not (stop_event and stop_event.is_set()):
+                wait_for_chat_ts = state.chat_processing_timestamp if state else chat_processing_timestamp
+                if wait_for_chat_ts is not None:
+                    while current_video_timestamp > wait_for_chat_ts + 1.0 and not (stop_event and stop_event.is_set()):
                         time.sleep(0.01)
+                        wait_for_chat_ts = state.chat_processing_timestamp if state else chat_processing_timestamp
 
                 audio_data = np.frombuffer(in_bytes, np.int16).astype(np.float32) / 32768.0
                 
@@ -222,7 +242,10 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                             print(msg)
                             log_message(log_folder, "transcript.log", msg)
                             log_json(log_folder, "merged.json", msg.to_dict())
-                            shared_deque.add_message(msg)
+                            if state:
+                                state.add_message(msg)
+                            else:
+                                shared_deque.add_message(msg)
                             should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
                             if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
                                 threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
@@ -251,7 +274,10 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                     print(msg)
                     log_message(log_folder, "transcript.log", msg)
                     log_json(log_folder, "merged.json", msg.to_dict())
-                    shared_deque.add_message(msg)
+                    if state:
+                        state.add_message(msg)
+                    else:
+                        shared_deque.add_message(msg)
                     should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
                     if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
                         threading.Thread(target=question_handler, args=(msg,), daemon=True).start()

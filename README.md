@@ -1,6 +1,6 @@
 # Qontex
 
-Qontex is a stream context agent for Twitch streams and local video files. It captures audio, transcribes streamer speech with `faster-whisper`, ingests Twitch chat, builds a merged chronological timeline, detects likely questions, and can use Gemini to answer questions from recent stream context.
+Qontex is a stream context agent for Twitch streams and local video files. It captures audio, transcribes streamer speech with `faster-whisper`, ingests Twitch chat, builds a merged chronological timeline, detects likely questions, and can use a configurable QA agent to answer questions from recent stream context.
 
 ## Features
 
@@ -11,8 +11,8 @@ Qontex is a stream context agent for Twitch streams and local video files. It ca
 - Replays matching local chat JSON files alongside local video files.
 - Keeps chat and transcript synchronized in `merged.json`.
 - Detects likely questions from chat and transcript text when enabled.
-- Sends question context to Gemini when QA is enabled.
-- Optionally includes recent video frames in Gemini context outside fast mode.
+- Sends question context to a configurable QA agent when QA is enabled.
+- Optionally includes recent video frames in QA context outside fast mode.
 - Logs sessions under `logs/<streamer>/<date>/`.
 - Includes a static dashboard prototype in `index.html`.
 
@@ -23,7 +23,9 @@ Qontex is a stream context agent for Twitch streams and local video files. It ca
 |-- main.py                 # Main runtime entry point and command loop
 |-- streamcapture.py        # Audio extraction, VAD, frame capture, transcription
 |-- twitch_chat.py          # Live Twitch chat and local chat replay
-|-- gemini_agent.py         # Gemini QA and item-processing helpers
+|-- qa_agent.py             # QA adapter factory and interface
+|-- gemini_agent.py         # Built-in Gemini QA and item-processing adapter
+|-- stream_state.py         # StreamState, StreamConfig, Message, and timeline buffer data classes
 |-- utils.py                # Config, logging, question detection, shared timeline buffer
 |-- install_dependencies.py # Dependency installer with PyTorch CUDA wheel selection
 |-- config.toml             # Shared runtime configuration
@@ -39,7 +41,7 @@ Qontex is a stream context agent for Twitch streams and local video files. It ca
 - `ffmpeg` available on `PATH`
 - Streamlink CLI available on `PATH` for Twitch livestreams
 - Twitch EventSub chat credentials for live chat
-- Gemini API key when Gemini is enabled
+- Gemini API key when `QA_AGENT = "gemini"` is enabled
 - CUDA-compatible GPU recommended for Whisper, VAD, and classifier performance
 
 Install Python dependencies with:
@@ -82,7 +84,7 @@ TWITCH_BOT_ID=your_bot_user_id
 
 Live Twitch chat uses TwitchIO EventSub. `TWITCH_TOKEN` must belong to `TWITCH_BOT_ID`, match `TWITCH_CLIENT_ID`, and include the `user:read:chat` scope. `TWITCH_REFRESH_TOKEN` is required by the live chat listener and is also used for automatic token refresh.
 
-`GENAI_API_KEY` is only required when Gemini is enabled. It is not required when running with `--no-gemini` or with `PROCESS_FAST = true`.
+`GENAI_API_KEY` is only required when `QA_AGENT = "gemini"` is enabled. It is not required for custom local adapters, `QA_AGENT = "none"`, `--no-gemini`, or `PROCESS_FAST = true`.
 
 ## Configuration
 
@@ -90,10 +92,14 @@ Live Twitch chat uses TwitchIO EventSub. `TWITCH_TOKEN` must belong to `TWITCH_B
 
 ```toml
 CHANNEL = "streamer_name_or_local_video_path"
+SOURCE_TYPE = "auto"
+CHAT_FILE = ""
 TWITCH_USERNAME = "your_twitch_username"
 PROCESS_FAST = false
 ENABLE_QUESTION_DETECTOR = true
 ENABLE_QA = true
+QA_AGENT = "gemini"
+QA_MODEL = "gemini-3-flash-preview"
 ENABLE_QA_CHAT = false
 ENABLE_QA_TRANSCRIPT = true
 ENABLE_ITEMS = false
@@ -109,15 +115,19 @@ LOG_BUFFER_DELAY = 20
 Key options:
 
 - `CHANNEL`: Twitch channel name, `#channel`, Twitch URL, or local video path.
+- `SOURCE_TYPE`: `auto`, `livestream`, or `vod`. Use `vod` to force offline replay with a chat file.
+- `CHAT_FILE`: Optional offline chat JSON/JSONL path for VOD mode. Blank uses `video_name.json` beside the video.
 - `TWITCH_USERNAME`: Twitch account label used by the chat listener.
 - `PROCESS_FAST`: For local videos, processes as fast as possible instead of realtime.
 - `ENABLE_QUESTION_DETECTOR`: Enables heuristic and classifier-based question detection.
-- `ENABLE_QA`: Allows detected questions to be sent to Gemini.
-- `ENABLE_QA_CHAT`: Enables Gemini answers for chat questions when QA is enabled.
-- `ENABLE_QA_TRANSCRIPT`: Enables Gemini answers for transcript questions when QA is enabled.
-- `ENABLE_ITEMS`: Periodically asks Gemini to identify collected items from recent context.
-- `QA_CONTEXT_WINDOW`: Number of seconds of context used for Gemini answers.
-- `ENABLE_VISUAL_CONTEXT`: Sends recent captured frames to Gemini when enabled.
+- `ENABLE_QA`: Allows detected questions to be sent to the configured QA agent.
+- `QA_AGENT`: QA backend. Use `gemini`, `none`, or `module:ClassName` for a custom adapter.
+- `QA_MODEL`: Optional model name for the configured QA backend.
+- `ENABLE_QA_CHAT`: Enables QA answers for chat questions when QA is enabled.
+- `ENABLE_QA_TRANSCRIPT`: Enables QA answers for transcript questions when QA is enabled.
+- `ENABLE_ITEMS`: Periodically asks the QA agent to identify collected items from recent context.
+- `QA_CONTEXT_WINDOW`: Number of seconds of context used for QA answers.
+- `ENABLE_VISUAL_CONTEXT`: Sends recent captured frames to the QA agent when enabled.
 - `LOG_ANSWERS_SEPARATELY`: Writes answered questions to `answered_questions.json`.
 - `LOG_QUESTION_DETECTIONS`: Prints question detection events.
 - `FILTER_SHORT_QUESTIONS`: Ignores very short chat questions when enabled.
@@ -129,8 +139,8 @@ Key options:
 `PROCESS_FAST = true` is intended for local video files. In fast mode:
 
 - `ffmpeg` does not use realtime input throttling.
-- Gemini QA, chat QA, transcript QA, item processing, and visual context are forced off at runtime.
-- Manual `/ask` is blocked so a fast run cannot accidentally hit the Gemini API.
+- QA, chat QA, transcript QA, item processing, and visual context are forced off at runtime.
+- Manual `/ask` is blocked so a fast run cannot accidentally call a QA backend.
 - Video frame capture is disabled.
 - Matching local chat JSON is still replayed and synchronized with transcription.
 
@@ -150,6 +160,31 @@ Supported local chat inputs include TwitchDownloader-style JSON with a `comments
 
 When a local TwitchDownloader JSON file includes streamer and video metadata, Qontex uses it to choose the log folder streamer name and stream start date.
 
+You can also force VOD mode and point at any offline chat file:
+
+```toml
+SOURCE_TYPE = "vod"
+CHANNEL = "video/example.mp4"
+CHAT_FILE = "dev/vedalchat.json"
+```
+
+## QA Adapters
+
+The built-in adapter is configured with:
+
+```toml
+QA_AGENT = "gemini"
+QA_MODEL = "gemini-3-flash-preview"
+```
+
+To swap Gemini for another API or a local model, set `QA_AGENT` to a Python class path:
+
+```toml
+QA_AGENT = "local_agent:LocalAgent"
+```
+
+The adapter class should accept `state` or `state=` in its constructor and implement `answer_question(message)` and `direct_ask(question, timestamp=None)`. Optional methods are `process_items()`, `refresh_from_state()`, and `set_game_name(game_name)`.
+
 ## Usage
 
 Run the full agent:
@@ -158,7 +193,7 @@ Run the full agent:
 python main.py
 ```
 
-Run without Gemini:
+Run without the QA agent:
 
 ```powershell
 python main.py --no-gemini
@@ -183,7 +218,7 @@ While running, the command prompt accepts:
 - `clear`: Clear the question queue.
 - `reload`: Reload `config.toml` and `local.toml`; restarts workers when capture-related settings change.
 - `/<config_key> <value>`: Update a setting in `config.toml` and trigger reload, for example `/ENABLE_QA false`.
-- `/ask <question>`: Send a direct question to Gemini, unless fast mode or `--no-gemini` is active.
+- `/ask <question>`: Send a direct question to the QA agent, unless fast mode or `--no-gemini` is active.
 - `quit`: Stop workers, flush logs, and end the session.
 
 ## Logs
@@ -199,8 +234,8 @@ Common files:
 - `session.log`: Session start and stop events.
 - `chat.log`: Live or replayed chat messages.
 - `transcript.log`: Transcribed streamer audio.
-- `merged.json`: JSON-lines timeline of chat, transcript, and Gemini messages.
-- `answered_questions.json`: Gemini answers when separate answer logging is enabled.
+- `merged.json`: JSON-lines timeline of chat, transcript, and QA messages.
+- `answered_questions.json`: QA answers when separate answer logging is enabled.
 - `collected_items.json`: Item detection output when item processing is enabled.
 
 `merged.json` writes through a small buffer so chat and transcript entries can be sorted by timestamp before being appended.
@@ -213,6 +248,5 @@ Common files:
 
 - First run can take time because Whisper, Silero VAD, and the question classifier may download or load large models.
 - CPU execution is supported but expected to be slow.
-- `PROCESS_FAST` is safest for local offline transcription because it disables Gemini and frame capture.
+- `PROCESS_FAST` is safest for local offline transcription because it disables QA and frame capture.
 - Keep Twitch tokens and Gemini API keys out of source control.
-

@@ -21,11 +21,13 @@ class TwitchChatListener(commands.Bot):
         question_handler=None,
         category_handler=None,
         stream_start_handler=None,
+        state=None,
     ):
+        self.state = state
         self.bot_nick = nick
         self.channel = channel.lstrip("#").lower()
-        self.log_folder = log_folder
-        self.start_time_ref = start_time_ref
+        self.log_folder = log_folder or (state.log_folder if state else None)
+        self.start_time_ref = start_time_ref or (state.current_timestamp if state else None)
         self.question_handler = question_handler
         self.category_handler = category_handler
         self.stream_start_handler = stream_start_handler
@@ -116,7 +118,7 @@ class TwitchChatListener(commands.Bot):
 
         await self.subscribe_websocket(payload=subscription)
         print(f"Successfully subscribed to live chat for {self.channel}!")
-        
+
         if not self._info_loop_started:
             self._info_loop_started = True
             self._info_task = asyncio.create_task(self.refresh_stream_info_loop())
@@ -135,7 +137,10 @@ class TwitchChatListener(commands.Bot):
 
         log_message(self.log_folder, "chat.log", msg)
         log_json(self.log_folder, "merged.json", msg.to_dict())
-        shared_deque.add_message(msg)
+        if self.state:
+            self.state.add_message(msg)
+        else:
+            shared_deque.add_message(msg)
 
         should_detect_question = self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
         if should_detect_question and self.is_likely_question(msg.text, msg.type):
@@ -156,7 +161,7 @@ class TwitchChatListener(commands.Bot):
             if self.category_handler:
                 self.category_handler(category)
             print(f"\rTwitch category: {category}")
-        
+
         if started_at and self.stream_start_handler:
             self.stream_start_handler(started_at.timestamp())
         return category, started_at
@@ -180,9 +185,10 @@ class TwitchChatListener(commands.Bot):
 
 
 class LocalChatListener:
-    def __init__(self, json_path, log_folder, question_handler=None, process_fast=False):
+    def __init__(self, json_path, log_folder, question_handler=None, process_fast=False, state=None, initialize_sync=True):
+        self.state = state
         self.json_path = json_path
-        self.log_folder = log_folder
+        self.log_folder = log_folder or (state.log_folder if state else None)
         self.question_handler = question_handler
         self.process_fast = process_fast
         self.messages = []
@@ -192,12 +198,12 @@ class LocalChatListener:
         self.streamer_login = None
         self.stream_start_date = None
         self._load_messages()
-        
-        import streamcapture
-        if self.messages:
-            streamcapture.chat_processing_timestamp = self.messages[0]["timestamp"]
-        else:
-            streamcapture.chat_processing_timestamp = float('inf')
+
+        if initialize_sync:
+            if self.messages:
+                self._set_chat_processing_timestamp(self.messages[0]["timestamp"])
+            else:
+                self._set_chat_processing_timestamp(float('inf'))
 
     def _load_messages(self):
         try:
@@ -205,7 +211,7 @@ class LocalChatListener:
                 content = f.read().strip()
                 if not content:
                     return
-                
+
                 # Check if it's JSON lines
                 if content.startswith('{') and '\n' in content:
                     lines = content.split('\n')
@@ -239,7 +245,7 @@ class LocalChatListener:
                         elif "video" in data and isinstance(data["video"], dict):
                             self.streamer_name = data["video"].get("user_name")
                             self.streamer_login = data["video"].get("user_login")
-                            
+
                         if "comments" in data:
                             # TwitchDownloader format
                             for comment in data["comments"]:
@@ -269,23 +275,22 @@ class LocalChatListener:
                                 continue
                             if text:
                                 self.messages.append({"timestamp": float(ts), "user": user, "text": text})
-                            
+
             self.messages.sort(key=lambda x: x["timestamp"])
         except Exception as e:
             print(f"Error loading local chat JSON: {e}")
 
     def listen(self):
-        import streamcapture
         print(f"Loaded {len(self.messages)} chat messages from {self.json_path}")
         msg_idx = 0
-        
+
         try:
             while not self._stop_event.is_set() and msg_idx < len(self.messages):
                 target_ts = self.messages[msg_idx]["timestamp"]
-                streamcapture.chat_processing_timestamp = target_ts
-                
-                current_ts = streamcapture.current_video_timestamp
-                
+                self._set_chat_processing_timestamp(target_ts)
+
+                current_ts = self._current_video_timestamp()
+
                 if current_ts < target_ts:
                     time.sleep(0.01)
                     continue
@@ -293,19 +298,22 @@ class LocalChatListener:
                 msg_idx += 1
 
                 if msg_idx < len(self.messages):
-                    streamcapture.chat_processing_timestamp = self.messages[msg_idx]["timestamp"]
+                    self._set_chat_processing_timestamp(self.messages[msg_idx]["timestamp"])
                 else:
-                    streamcapture.chat_processing_timestamp = float('inf')
+                    self._set_chat_processing_timestamp(float('inf'))
         finally:
-            streamcapture.chat_processing_timestamp = float('inf')
+            self._set_chat_processing_timestamp(float('inf'))
 
     def _process_message(self, msg_data):
         msg = Message(msg_data["timestamp"], "chat", msg_data["text"], user=msg_data["user"])
         print(f"\r{msg}")
         log_message(self.log_folder, "chat.log", msg)
         log_json(self.log_folder, "merged.json", msg.to_dict())
-        shared_deque.add_message(msg)
-        
+        if self.state:
+            self.state.add_message(msg)
+        else:
+            shared_deque.add_message(msg)
+
         should_detect_question = self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
         if should_detect_question and is_likely_question(msg.text, msg.type):
             self.question_queue.append({"user": msg.user, "msg": msg.text, "timestamp": msg.timestamp})
@@ -313,9 +321,24 @@ class LocalChatListener:
                 self.question_queue.pop(0)
             if self.question_handler:
                 threading.Thread(target=self.question_handler, args=(msg,), daemon=True).start()
-                    
+
     def stop(self):
         self._stop_event.set()
+
+    def _set_chat_processing_timestamp(self, timestamp):
+        if self.state:
+            self.state.chat_processing_timestamp = timestamp
+            return
+        import streamcapture
+
+        streamcapture.chat_processing_timestamp = timestamp
+
+    def _current_video_timestamp(self):
+        if self.state:
+            return self.state.current_video_timestamp
+        import streamcapture
+
+        return streamcapture.current_video_timestamp
 
 
 if __name__ == "__main__":

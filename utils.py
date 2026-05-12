@@ -5,11 +5,10 @@ import subprocess
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
-from collections import deque
 import threading
 import time
-from transformers import pipeline
 import tomllib
+from stream_state import Message, SharedDeque
 
 _log_lock = threading.Lock()
 _config_lock = threading.Lock()
@@ -26,15 +25,15 @@ def _read_toml(path):
 def load_config(path="config.toml", local_path="local.toml"):
     """Load shared config, then overlay local machine-specific settings."""
     global _config
-    
+
     # Normalize keys to uppercase to prevent case-sensitivity issues across config files
     raw_config = _read_toml(path)
     config = {k.upper(): v for k, v in raw_config.items()}
-    
+
     if local_path and os.path.exists(local_path):
         local_raw = _read_toml(local_path)
         config.update({k.upper(): v for k, v in local_raw.items()})
-        
+
     with _config_lock:
         _config = config
     return config
@@ -61,39 +60,6 @@ try:
     load_config()
 except Exception:
     _config = {}
-
-class Message:
-    def __init__(self, timestamp, msg_type, text, user=None, **kwargs):
-        self.timestamp = timestamp  # float seconds
-        self.type = msg_type  # "transcript" or "chat"
-        self.text = text
-        self.user = user  # for chat, the username; for transcript, "streamer"
-        self.extra = kwargs  # any additional data
-
-    def to_dict(self):
-        return {
-            "timestamp": self.timestamp,
-            "type": self.type,
-            "text": self.text,
-            "user": self.user,
-            **self.extra
-        }
-
-    def format_timestamp(self):
-        """Format timestamp as [h:mm:ss]"""
-        total_seconds = max(0, int(self.timestamp))
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return "[{}:{:02d}:{:02d}]".format(hours, minutes, seconds)
-
-    def __str__(self):
-        ts = self.format_timestamp()
-        if self.type == "transcript":
-            return "{} {}: {}".format(ts, self.user or "TRANSCRIPT", self.text)
-        elif self.type == "chat":
-            return "{} {}: {}".format(ts, self.user, self.text)
-        else:
-            return "{} {}: {}".format(ts, self.type.upper(), self.text)
 
 def get_streamer_name(source):
     """Extract streamer name from URL or return as is."""
@@ -184,7 +150,47 @@ def log_json(folder, filename, data, mode='a'):
     if _flush_thread is None:
         start_buffer_flusher()
 
+_standalone_detector_module = None
+_standalone_detector_mtime = 0
+
+def _get_standalone_detector():
+    global _standalone_detector_module, _standalone_detector_mtime
+    import importlib.util
+    import sys
+    import os
+
+    dev_dir = os.path.abspath("dev")
+    pipeline_path = os.path.join(dev_dir, "question_detection_pipeline.py")
+
+    if not os.path.exists(pipeline_path):
+        raise FileNotFoundError(f"Cannot find {pipeline_path}")
+
+    current_mtime = os.path.getmtime(pipeline_path)
+
+    if _standalone_detector_module is None or current_mtime > _standalone_detector_mtime:
+        if dev_dir not in sys.path:
+            sys.path.insert(0, dev_dir)
+
+        spec = importlib.util.spec_from_file_location("question_detection_pipeline", pipeline_path)
+        new_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(new_module)
+
+        _standalone_detector_module = new_module
+        _standalone_detector_mtime = current_mtime
+
+    return _standalone_detector_module
+
 def preload_classifier():
+    detector_type = get_config_value("QUESTION_DETECTOR_TYPE", "standard").lower()
+    if detector_type == "standalone":
+        try:
+            mod = _get_standalone_detector()
+            if hasattr(mod, "preload_classifier"):
+                mod.preload_classifier()
+        except Exception as e:
+            print(f"Failed to preload standalone detector: {e}")
+        return
+
     global _classifier
     if _classifier is None:
         import torch
@@ -204,6 +210,18 @@ def is_likely_question(message, msg_type="chat"):
     if not get_config_value("ENABLE_QUESTION_DETECTOR", True):
         return False
         
+    detector_type = get_config_value("QUESTION_DETECTOR_TYPE", "standard").lower()
+    if detector_type == "standalone":
+        try:
+            mod = _get_standalone_detector()
+            if hasattr(mod, "is_likely_question"):
+                return mod.is_likely_question(message, msg_type)
+            else:
+                print("[!] Standalone detector missing 'is_likely_question' function. Falling back to standard...")
+        except Exception as e:
+            print(f"[!] Failed to run standalone detector: {e}")
+            return False
+
     global _classifier
     
     clean_message = message.strip()
@@ -295,28 +313,6 @@ def log_start_stop(folder, action, uptime=None):
     else:
         msg = "Logging {} at {}".format(action, now)
     log_message(folder, "session.log", msg)
-
-class SharedDeque:
-    def __init__(self, max_age_seconds=180):  # 3 minutes
-        self.deque = deque()
-        self.max_age = max_age_seconds
-        self.lock = threading.Lock()
-
-    def add_message(self, message):
-        with self.lock:
-            self.deque.append(message)
-            # Remove old messages
-            current_time = message.timestamp
-            while self.deque and (current_time - self.deque[0].timestamp) > self.max_age:
-                self.deque.popleft()
-
-    def get_recent(self):
-        with self.lock:
-            return list(self.deque)
-
-    def clear(self):
-        with self.lock:
-            self.deque.clear()
 
 # Global shared deque
 shared_deque = SharedDeque()
