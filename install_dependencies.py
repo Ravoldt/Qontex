@@ -112,7 +112,7 @@ def print_detected_cuda_versions(cuda_versions):
 
 
 def install_pytorch(wheel_tag, dry_run=False):
-    command = [sys.executable, "-m", "pip", "install", "torch"]
+    command = [sys.executable, "-m", "pip", "install", "torch", "torchvision", "torchaudio"]
     if wheel_tag:
         command.extend(["--index-url", f"https://download.pytorch.org/whl/{wheel_tag}"])
     else:

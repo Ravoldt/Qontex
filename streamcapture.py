@@ -2,6 +2,11 @@ import subprocess
 import time
 import numpy as np
 import os
+import sys
+import importlib
+import tempfile
+import wave
+from pathlib import Path
 import cv2
 import threading
 from collections import deque
@@ -24,26 +29,227 @@ audio_chunks = deque(maxlen=int(shared_deque.max_age / 0.032))
 
 _whisper_model = None
 _vad_model = None
+_mega_asr_module = None
+_mega_asr_import_failed = False
 
-def preload_models():
+class _MegaASRAdapter:
+    def __init__(self, mega_asr_cls, repo_root=None):
+        self._mega_asr_cls = mega_asr_cls
+        self._repo_root = Path(repo_root).resolve() if repo_root else None
+        self._model = None
+
+    def _checkpoint_dir(self):
+        configured = os.environ.get("MEGA_ASR_CKPT_DIR")
+        if configured:
+            return Path(configured).expanduser().resolve()
+        if self._repo_root is not None:
+            return self._repo_root / "ckpt" / "Mega-ASR"
+        return Path("ckpt") / "Mega-ASR"
+
+    def preload_model(self):
+        if self._model is not None:
+            return self._model
+
+        ckpt_dir = self._checkpoint_dir()
+        required_paths = [
+            ckpt_dir / "Qwen3-ASR-1.7B",
+            ckpt_dir / "mega-asr-merged",
+            ckpt_dir / "audio_quality_router" / "best_acc_model.safetensors",
+        ]
+        missing_paths = [str(path) for path in required_paths if not path.exists()]
+        if missing_paths:
+            raise FileNotFoundError(
+                "Mega-ASR weights are missing. Run "
+                "`.\\.venv\\Scripts\\python.exe Mega-ASR\\scripts\\download.py` "
+                f"or set MEGA_ASR_CKPT_DIR. Missing: {', '.join(missing_paths)}"
+            )
+
+        kwargs = {
+            "model_path": ckpt_dir / "Qwen3-ASR-1.7B",
+            "lora_dir": ckpt_dir / "mega-asr-merged",
+            "router_checkpoint": ckpt_dir / "audio_quality_router" / "best_acc_model.safetensors",
+            "backend": "transformers",
+        }
+
+        device_map = os.environ.get("MEGA_ASR_DEVICE_MAP")
+        if device_map:
+            kwargs["device_map"] = device_map
+
+        routing = os.environ.get("MEGA_ASR_ROUTING")
+        if routing is not None:
+            kwargs["routing_enabled"] = routing.strip().lower() in ("1", "true", "yes", "y", "on")
+
+        threshold = os.environ.get("MEGA_ASR_THRESHOLD")
+        if threshold:
+            kwargs["quality_threshold"] = float(threshold)
+
+        try:
+            self._model = self._mega_asr_cls(**kwargs)
+        except ModuleNotFoundError as e:
+            raise RuntimeError(_mega_asr_install_hint(e)) from e
+        return self._model
+
+    def infer_from_memory(self, audio_array, sampling_rate=16000):
+        model = self.preload_model()
+        wav_path = _write_temp_wav(audio_array, sampling_rate)
+        try:
+            return model.infer(wav_path, return_route=True)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+def _write_temp_wav(audio_array, sampling_rate=16000):
+    pcm = np.asarray(audio_array)
+    if pcm.dtype != np.int16:
+        pcm = np.clip(pcm, -1.0, 1.0)
+        pcm = (pcm * 32767.0).astype(np.int16)
+
+    fd, wav_path = tempfile.mkstemp(prefix="qontex-mega-asr-", suffix=".wav")
+    os.close(fd)
+    with wave.open(wav_path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sampling_rate)
+        wav_file.writeframes(pcm.tobytes())
+    return wav_path
+
+def _resolve_mega_asr_paths(mega_asr_path):
+    candidates = []
+    if mega_asr_path:
+        candidates.append(Path(mega_asr_path).expanduser())
+
+    bundled_repo = Path(__file__).resolve().parent / "Mega-ASR"
+    if bundled_repo.exists():
+        candidates.append(bundled_repo)
+
+    for candidate in candidates:
+        try:
+            path = candidate.resolve()
+        except OSError:
+            path = candidate
+
+        if path.is_file():
+            for parent in path.parents:
+                src_dir = parent / "src"
+                if (src_dir / "MegaASR" / "model" / "megaASR.py").is_file():
+                    return src_dir, parent
+            continue
+
+        if not path.is_dir():
+            continue
+
+        if (path / "src" / "MegaASR" / "model" / "megaASR.py").is_file():
+            return path / "src", path
+        if (path / "MegaASR" / "model" / "megaASR.py").is_file():
+            return path, path.parent
+        if path.name == "MegaASR" and (path / "model" / "megaASR.py").is_file():
+            return path.parent, path.parent.parent
+        if path.name == "model" and (path / "megaASR.py").is_file():
+            src_dir = path.parent.parent
+            return src_dir, src_dir.parent
+
+    return None, None
+
+def _mega_asr_install_hint(error):
+    if isinstance(error, ModuleNotFoundError):
+        return (
+            f"{error}. Install Mega-ASR's dependencies with "
+            "`.\\.venv\\Scripts\\python.exe -m pip install qwen-asr soundfile scipy`."
+        )
+    return str(error)
+
+def _import_mega_asr():
+    global _mega_asr_module, _mega_asr_import_failed
+    
+    if _mega_asr_module is not None:
+        return _mega_asr_module
+    if _mega_asr_import_failed:
+        return None
+        
+    mega_asr_path = get_config_value("MEGA_ASR_PATH")
+            
+    try:
+        src_dir, repo_root = _resolve_mega_asr_paths(mega_asr_path)
+        if mega_asr_path and src_dir is None:
+            raise ImportError(
+                f"Could not find MegaASR.model.megaASR from MEGA_ASR_PATH={mega_asr_path!r}. "
+                "Set MEGA_ASR_PATH to the Mega-ASR repo root or its src folder."
+            )
+
+        if src_dir is not None and str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+
+        module = importlib.import_module("MegaASR.model.megaASR")
+        _mega_asr_module = _MegaASRAdapter(module.MegaASR, repo_root)
+        return _mega_asr_module
+    except Exception as e:
+        _mega_asr_import_failed = True
+        print(f"\n[QONTEX] ERROR: Failed to import Mega-ASR. Details: {_mega_asr_install_hint(e)}\n")
+        return None
+
+def _mega_asr_segments(result):
+    if result is None:
+        return []
+    if isinstance(result, str):
+        return [(result, 0.0)]
+    if isinstance(result, dict):
+        text = (
+            result.get("text")
+            or result.get("transcription")
+            or result.get("result")
+            or result.get("output")
+            or ""
+        )
+        if isinstance(text, (dict, list, tuple)):
+            return _mega_asr_segments(text)
+        return [(str(text), float(result.get("start", 0.0) or 0.0))] if text else []
+    if isinstance(result, (list, tuple)):
+        segments = []
+        for item in result:
+            if hasattr(item, "text"):
+                segments.append((item.text, float(getattr(item, "start", 0.0) or 0.0)))
+            elif isinstance(item, dict):
+                segments.extend(_mega_asr_segments(item))
+            elif isinstance(item, str):
+                segments.append((item, 0.0))
+        return segments
+    if hasattr(result, "text"):
+        return [(result.text, float(getattr(result, "start", 0.0) or 0.0))]
+    return []
+
+def preload_models(transcription_model="faster-whisper"):
     global _whisper_model, _vad_model
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("WARNING: CUDA is not available. Loading models on CPU (this will be slow).")
-        compute_type = "int8"
-    else:
-        compute_type = "float16"
+    if transcription_model == "faster-whisper":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cpu":
+            print("[QONTEX] WARNING: CUDA is not available. Loading models on CPU (this will be slow).")
+            compute_type = "int8"
+        else:
+            compute_type = "float16"
 
-    if _whisper_model is None:
-        print(f"Loading faster-whisper model into {'VRAM' if device == 'cuda' else 'RAM'}... (this may take a moment)")
-        _whisper_model = WhisperModel("large-v3", device=device, compute_type=compute_type) 
-    
-    if _vad_model is None:
-        print(f"Loading Silero VAD model into {'VRAM' if device == 'cuda' else 'RAM'}...")
-        _vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, trust_repo=True)
-        _vad_model = _vad_model.to(device)
-        _vad_model.eval()
+        if _whisper_model is None:
+            print(f"[QONTEX] Loading faster-whisper model into {'VRAM' if device == 'cuda' else 'RAM'}... (this may take a moment)")
+            _whisper_model = WhisperModel("large-v3", device=device, compute_type=compute_type) 
+        
+        if _vad_model is None:
+            print(f"[QONTEX] Loading Silero VAD model into {'VRAM' if device == 'cuda' else 'RAM'}...")
+            _vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, trust_repo=True)
+            _vad_model = _vad_model.to(device)
+            _vad_model.eval()
+            
+    elif transcription_model == "mega-asr":
+        megaASR = _import_mega_asr()
+        if not megaASR:
+            raise RuntimeError("Mega-ASR could not be loaded; see the error above.")
+        print("[QONTEX] Preloading Mega-ASR model...")
+        try:
+            megaASR.preload_model()
+        except Exception as e:
+            print(f"\n[QONTEX] ERROR: Failed to preload Mega-ASR. Details: {e}\n")
+            raise
 
 def start_audio_capture(source, process_fast=False, enable_video=None):
     """Starts a background process to extract audio from a video or livestream."""
@@ -59,7 +265,7 @@ def start_audio_capture(source, process_fast=False, enable_video=None):
         command.append("-re")
         
     if is_livestream:
-        print(f"Resolving stream URL for {source}...")
+        print(f"[QONTEX] Resolving stream URL for {source}...")
         try:
             if enable_video is None:
                 enable_video = get_config_value("ENABLE_VISUAL_CONTEXT", False)
@@ -70,13 +276,13 @@ def start_audio_capture(source, process_fast=False, enable_video=None):
             ).decode("utf-8").strip()
             command.extend(["-i", m3u8_url])
         except subprocess.CalledProcessError as e:
-            print(f"Error resolving stream. Is the streamer offline?\nDetails: {e.output.decode('utf-8').strip()}")
+            print(f"[QONTEX] Error resolving stream. Is the streamer offline?\nDetails: {e.output.decode('utf-8').strip()}")
             return None, None
         except FileNotFoundError:
-            print("Error: Streamlink is not installed or not in your system PATH.")
+            print("[QONTEX] Error: Streamlink is not installed or not in your system PATH.")
             return None, None
         except Exception as e:
-            print(f"Error resolving stream: {e}")
+            print(f"[QONTEX] Error resolving stream: {e}")
             return None, None
     else:
         command.extend(["-i", source])
@@ -94,7 +300,7 @@ def start_audio_capture(source, process_fast=False, enable_video=None):
         return process, m3u8_url
         
     except FileNotFoundError:
-        print("Error: Streamlink is not installed or not in your system PATH.")
+        print("[QONTEX] Error: Streamlink is not installed or not in your system PATH.")
         return None, None
 
 def capture_video_frames(source_url, stop_event=None, target_fps=1.0, state=None):
@@ -142,8 +348,10 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     if transcript_user is None:
         transcript_user = state.config.stream_name if state else get_streamer_name(source)
     
-    if _whisper_model is None or _vad_model is None:
-        preload_models()
+    transcription_model_name = state.config.transcription_model if state else get_config_value("TRANSCRIPTION_MODEL", "faster-whisper")
+    
+    if (transcription_model_name == "faster-whisper" and (_whisper_model is None or _vad_model is None)) or transcription_model_name == "mega-asr":
+        preload_models(transcription_model_name)
     
     model = _whisper_model
     vad_model = _vad_model
@@ -158,7 +366,7 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             video_thread = threading.Thread(target=capture_video_frames, args=(target_url, stop_event, target_fps, state), daemon=True)
             video_thread.start()
         
-        print("Audio stream captured! Running AI-VAD loop...")
+        print("[QONTEX] Audio stream captured! Running AI-VAD loop...")
         
         try:                      
             # Silero natively prefers exactly 32ms chunks (512 samples at 16kHz)
@@ -191,6 +399,30 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                     
                 total_chunks += 1
 
+                def process_transcript_segment(text, start_offset, chunk_base_time, audio_start_time_ref):
+                    if not text or not text.strip():
+                        return
+                    if STREAM_START_TIME is None or process_fast:
+                        msg_time = chunk_base_time + start_offset
+                    else:
+                        segment_wall_time = audio_start_time_ref + chunk_base_time + start_offset
+                        msg_time = segment_wall_time - STREAM_START_TIME
+
+                    msg_time = max(0.0, msg_time)  
+                        
+                    msg = Message(msg_time, "transcript", text.strip(), user=transcript_user)
+                    print(msg)
+                    log_message(log_folder, "transcript.log", msg)
+                    log_json(log_folder, "merged.json", msg.to_dict())
+                    if state:
+                        state.add_message(msg)
+                    else:
+                        shared_deque.add_message(msg)
+                    should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+                    if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
+                        threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
+
+
                 global current_video_timestamp
                 if STREAM_START_TIME is None or process_fast:
                     current_video_timestamp = total_chunks * CHUNK_DURATION
@@ -208,82 +440,74 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
 
                 audio_data = np.frombuffer(in_bytes, np.int16).astype(np.float32) / 32768.0
                 
-                # Ask Silero if someone is speaking in this 32ms window
-                audio_tensor = torch.from_numpy(audio_data).to(device)
-                speech_prob = vad_model(audio_tensor, 16000).item()
-                
-                if speech_prob > SPEECH_THRESHOLD:
-                    is_speaking = True
-                    silence_counter = 0
-                    audio_buffer.append(audio_data)
-                elif is_speaking:
-                    silence_counter += 1
-                    audio_buffer.append(audio_data)
+                if transcription_model_name == "faster-whisper":
+                    audio_tensor = torch.from_numpy(audio_data).to(device)
+                    speech_prob = vad_model(audio_tensor, 16000).item()
                     
-                    # Cut the chunk if we hit a 1-second pause OR if they have talked non-stop for 5 seconds
-                    if silence_counter >= MAX_SILENCE_CHUNKS or len(audio_buffer) >= MAX_CHUNK_LIMIT:
-                        full_audio = np.concatenate(audio_buffer)
-                        
-                        # vad_filter=False because our Silero loop already perfectly trimmed the dead air!
-                        segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
-                        
-                        chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
-                        
-                        for segment in segments:
-                            if STREAM_START_TIME is None or process_fast:
-                                msg_time = chunk_base_time + segment.start
-                            else:
-                                segment_wall_time = audio_start_time + chunk_base_time + segment.start
-                                msg_time = segment_wall_time - STREAM_START_TIME
-
-                            msg_time = max(0.0, msg_time)  
-                                
-                            msg = Message(msg_time, "transcript", segment.text.strip(), user=transcript_user)
-                            print(msg)
-                            log_message(log_folder, "transcript.log", msg)
-                            log_json(log_folder, "merged.json", msg.to_dict())
-                            if state:
-                                state.add_message(msg)
-                            else:
-                                shared_deque.add_message(msg)
-                            should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
-                            if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
-                                threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
-                        
-                        audio_buffer = []
-                        is_speaking = False
+                    if speech_prob > SPEECH_THRESHOLD:
+                        is_speaking = True
                         silence_counter = 0
+                        audio_buffer.append(audio_data)
+                    elif is_speaking:
+                        silence_counter += 1
+                        audio_buffer.append(audio_data)
+                        
+                        if silence_counter >= MAX_SILENCE_CHUNKS or len(audio_buffer) >= MAX_CHUNK_LIMIT:
+                            full_audio = np.concatenate(audio_buffer)
+                            
+                            segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
+                            chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
+                            
+                            for segment in segments:
+                                process_transcript_segment(segment.text, segment.start, chunk_base_time, audio_start_time)
+                                
+                            audio_buffer = []
+                            is_speaking = False
+                            silence_counter = 0
+                
+                elif transcription_model_name == "mega-asr":
+                    audio_buffer.append(audio_data)
+                    if len(audio_buffer) >= MAX_CHUNK_LIMIT:
+                        full_audio = np.concatenate(audio_buffer)
+                        megaASR = _import_mega_asr()
+                        if megaASR:
+                            print(f"[QONTEX DEBUG] mega-asr: Inferring on {len(full_audio)} samples...")
+                            result = megaASR.infer_from_memory(full_audio)
+                            print(f"[QONTEX DEBUG] mega-asr: Result type={type(result)}, value={result}")
+                            chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
+                            segments = _mega_asr_segments(result)
+                            if segments:
+                                for text, start in segments:
+                                    process_transcript_segment(text, start, chunk_base_time, audio_start_time)
+                            else:
+                                print(f"[QONTEX DEBUG] mega-asr: Unhandled result format: {type(result)}")
+                        audio_buffer = []
 
             # Flush and transcribe any remaining audio when the stream ends
             if len(audio_buffer) > 0:
                 full_audio = np.concatenate(audio_buffer)
-                segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
                 
                 chunk_base_time = (total_chunks - len(audio_buffer)) * CHUNK_DURATION
                 
-                for segment in segments:
-                    if STREAM_START_TIME is None or process_fast:
-                        msg_time = chunk_base_time + segment.start
-                    else:
-                        segment_wall_time = audio_start_time + chunk_base_time + segment.start
-                        msg_time = segment_wall_time - STREAM_START_TIME
-
-                    msg_time = max(0.0, msg_time)  
-                        
-                    msg = Message(msg_time, "transcript", segment.text.strip(), user=transcript_user)
-                    print(msg)
-                    log_message(log_folder, "transcript.log", msg)
-                    log_json(log_folder, "merged.json", msg.to_dict())
-                    if state:
-                        state.add_message(msg)
-                    else:
-                        shared_deque.add_message(msg)
-                    should_detect_question = question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
-                    if should_detect_question and is_likely_question(msg.text, msg.type) and question_handler:
-                        threading.Thread(target=question_handler, args=(msg,), daemon=True).start()
+                if transcription_model_name == "faster-whisper":
+                    segments, _ = model.transcribe(full_audio, beam_size=5, vad_filter=False)
+                    for segment in segments:
+                        process_transcript_segment(segment.text, segment.start, chunk_base_time, audio_start_time)
+                elif transcription_model_name == "mega-asr":
+                    megaASR = _import_mega_asr()
+                    if megaASR:
+                        print(f"[QONTEX DEBUG] mega-asr (flush): Inferring on {len(full_audio)} samples...")
+                        result = megaASR.infer_from_memory(full_audio)
+                        print(f"[QONTEX DEBUG] mega-asr (flush): Result type={type(result)}, value={result}")
+                        segments = _mega_asr_segments(result)
+                        if segments:
+                            for text, start in segments:
+                                process_transcript_segment(text, start, chunk_base_time, audio_start_time)
+                        else:
+                            print(f"[QONTEX DEBUG] mega-asr (flush): Unhandled result format: {type(result)}")
                 
         except Exception as e:
-            print(f"Error in capture loop: {e}")
+            print(f"[QONTEX] Error in capture loop: {e}")
         finally:
             audio_process.terminate()
             audio_process.wait()
@@ -296,7 +520,7 @@ if __name__ == "__main__":
     try:
         config = load_config()
     except FileNotFoundError:
-        print("CRITICAL ERROR: config.toml is missing!")
+        print("[QONTEX] CRITICAL ERROR: config.toml is missing!")
         exit(1)
         
     source = config.get("CHANNEL", "")
@@ -306,15 +530,15 @@ if __name__ == "__main__":
         source = source.lstrip('#')
     
     if not source:
-        print("Please set the CHANNEL in config.toml!")
+        print("[QONTEX] Please set the CHANNEL in config.toml!")
         exit(1)
         
-    process_fast = config.get("PROCESS_FAST", False)
+    process_fast = config.get("PROCESS_FAST", False) if is_local_video else False
 
     streamer_name = get_streamer_name(source)
     stream_start = datetime.datetime.now()
     log_folder = create_stream_folder(streamer_name, stream_start)
     log_start_stop(log_folder, "start")
     
-    print(f"Testing capture loop for {source}...")
+    print(f"[QONTEX] Testing capture loop for {source}...")
     run_capture_loop(source, log_folder, process_fast=process_fast)

@@ -52,9 +52,9 @@ def _log_question_detection(message, msg_type, method, score=None, detail=None):
     source_tag = "[CHAT]" if msg_type == "chat" else "[TRANSCRIPT]"
     detail_text = f" [{detail}]" if detail else ""
     if score is None:
-        print(f"\r[!] Detected {source_tag} question via {method}{detail_text}: {message}")
+        print(f"\r[QONTEX] [!] Detected {source_tag} question via {method}{detail_text}: {message}")
     else:
-        print(f"\r[!] Detected {source_tag} question via {method}{detail_text} (Score: {score:.2f}): {message}")
+        print(f"\r[QONTEX] [!] Detected {source_tag} question via {method}{detail_text} (Score: {score:.2f}): {message}")
 
 try:
     load_config()
@@ -188,7 +188,7 @@ def preload_classifier():
             if hasattr(mod, "preload_classifier"):
                 mod.preload_classifier()
         except Exception as e:
-            print(f"Failed to preload standalone detector: {e}")
+            print(f"[QONTEX] Failed to preload standalone detector: {e}")
         return
 
     global _classifier
@@ -196,7 +196,7 @@ def preload_classifier():
         import torch
         from transformers import pipeline
         device = 0 if torch.cuda.is_available() else -1
-        print(f"Loading Question Classifier into {'VRAM' if device == 0 else 'RAM'}...")        
+        print(f"[QONTEX] Loading Question Classifier into {'VRAM' if device == 0 else 'RAM'}...")        
         dtype = torch.float16 if device == 0 else torch.float32
         _classifier = pipeline(
             "zero-shot-classification",
@@ -217,9 +217,9 @@ def is_likely_question(message, msg_type="chat"):
             if hasattr(mod, "is_likely_question"):
                 return mod.is_likely_question(message, msg_type)
             else:
-                print("[!] Standalone detector missing 'is_likely_question' function. Falling back to standard...")
+                print("[QONTEX] [!] Standalone detector missing 'is_likely_question' function. Falling back to standard...")
         except Exception as e:
-            print(f"[!] Failed to run standalone detector: {e}")
+            print(f"[QONTEX] [!] Failed to run standalone detector: {e}")
             return False
 
     global _classifier
@@ -326,7 +326,7 @@ def cut_video_segment(input_path, output_path, start_time, duration):
     try:
         subprocess.run(command, check=True, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
-        print("Error cutting video: {}".format(e))
+        print("[QONTEX] Error cutting video: {}".format(e))
 
 def refresh_twitch_token():
     """Validate the current Twitch token and refresh it if expired."""
@@ -336,6 +336,7 @@ def refresh_twitch_token():
     refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
 
     clean_token = token.replace("oauth:", "") if token else ""
+    required_scopes = {"user:read:chat"}
 
     if clean_token:
         req = urllib.request.Request("https://id.twitch.tv/oauth2/validate")
@@ -343,21 +344,28 @@ def refresh_twitch_token():
         try:
             with urllib.request.urlopen(req) as response:
                 if response.getcode() == 200:
-                    return token
+                    data = json.loads(response.read().decode("utf-8"))
+                    scopes = set(data.get("scopes", []))
+                    if required_scopes.issubset(scopes):
+                        return token
+                    else:
+                        missing = required_scopes - scopes
+                        print(f"[QONTEX] [*] Twitch token is valid but missing required scopes: {missing}")
+                        # Token is incomplete, proceed to refresh below
         except urllib.error.HTTPError:
             pass  # Token is invalid, proceed to refresh
 
     if not all([client_id, client_secret, refresh_token]):
-        print("[!] Twitch token may be expired. Add TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_REFRESH_TOKEN to .env to enable auto-refresh.")
+        print("[QONTEX] [!] Twitch token may be expired or incomplete. Add TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_REFRESH_TOKEN to .env to enable auto-refresh.")
         return token
 
-    print("[*] Twitch token expired. Attempting to refresh...")
+    print("[QONTEX] [*] Attempting to refresh Twitch token to obtain full credentials...")
     data = urllib.parse.urlencode({
         "client_id": client_id,
         "client_secret": client_secret,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "scope": "user:read:chat" #user:write:chat is not needed currently
+        "scope": " ".join(required_scopes)
     }).encode("utf-8")
 
     req = urllib.request.Request("https://id.twitch.tv/oauth2/token", data=data)
@@ -375,14 +383,14 @@ def refresh_twitch_token():
                     if new_refresh_token:
                         set_key(env_path, "TWITCH_REFRESH_TOKEN", new_refresh_token)
                 except Exception as e:
-                    print(f"[!] Could not update .env automatically: {e}")
+                    print(f"[QONTEX] [!] Could not update .env automatically: {e}")
 
                 os.environ["TWITCH_TOKEN"] = new_access_token
                 if new_refresh_token:
                     os.environ["TWITCH_REFRESH_TOKEN"] = new_refresh_token
-                print("[*] Twitch token successfully refreshed!")
+                print("[QONTEX] [*] Twitch token successfully refreshed!")
                 return new_access_token
     except Exception as e:
-        print(f"[!] Failed to refresh Twitch token: {e}")
+        print(f"[QONTEX] [!] Failed to refresh Twitch token: {e}")
 
     return token

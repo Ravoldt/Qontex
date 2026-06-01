@@ -35,7 +35,7 @@ class GeminiAgent(BaseQAAgent):
     ):
         self.client = genai.Client(api_key=api_key)
         self.state = state
-        self.model_name = model_name or "gemini-3-flash-preview"
+        self.model_name = model_name or "gemini-2.5-pro"
         self.log_folder = log_folder
         self.start_time_ref = start_time_ref
         self.game_name = game_name or "the game being played on stream"
@@ -143,7 +143,7 @@ Target Question from '{username}':
             self._log_answer(gemini_msg)
             return answer
         except Exception as e:
-            print(f"\nGemini API Error: {e}\n")
+            print(f"\n[QONTEX] Gemini API Error: {e}\n")
             return None
 
     def direct_ask(self, question, timestamp=None, video_frames_deque=None, audio_chunks_deque=None):
@@ -164,7 +164,7 @@ Context:
         self._append_media_context(contents, video_frames_deque, audio_chunks_deque, slice_to_context_window=False)
         attached_frames = max(0, len(contents) - initial_count)
         if attached_frames and self.enable_visual_context:
-            print(f"[*] Attached {attached_frames} media parts to Gemini direct ask.")
+            print(f"[QONTEX] [*] Attached {attached_frames} media parts to Gemini direct ask.")
 
         try:
             response = self.client.models.generate_content(
@@ -176,7 +176,7 @@ Context:
             )
             answer = response.text.strip()
 
-            print(f"\n[Gemini Console Response]:\n{answer}\n")
+            print(f"\n[QONTEX] [Gemini Console Response]:\n{answer}\n")
 
             gemini_msg = Message(
                 msg_time,
@@ -191,7 +191,7 @@ Context:
 
             return answer
         except Exception as e:
-            print(f"\nGemini API Error: {e}\n")
+            print(f"\n[QONTEX] Gemini API Error: {e}\n")
             return None
 
     def process_items(self, video_frames_deque=None, audio_chunks_deque=None):
@@ -236,7 +236,7 @@ Context:
                 return
             log_json(self.log_folder, "collected_items.json", data)
         except Exception as e:
-            print(f"Gemini item processing error: {e}")
+            print(f"[QONTEX] Gemini item processing error: {e}")
 
     def _context_string(self, timestamp, window):
         context_msgs = [str(m) for m in self._context_messages(timestamp, window)]
@@ -324,7 +324,7 @@ Context:
                     for item in data.get("items", []):
                         self._remember_item_event(item, data.get("timestamp"))
         except Exception as e:
-            print(f"Gemini item de-duplication preload failed: {e}")
+            print(f"[QONTEX] Gemini item de-duplication preload failed: {e}")
 
     def _filter_new_item_events(self, items, analysis_timestamp):
         new_items = []

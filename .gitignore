@@ -12,3 +12,4 @@ local.toml
 dev/
 downloader.py
 .venv/
+Mega-ASR/

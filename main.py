@@ -63,7 +63,7 @@ def configure_agent(state, no_gemini=False, previous_config=None):
     if disabled:
         state.agent = None
         reason = "PROCESS_FAST is enabled" if state.config.process_fast else "--no-gemini flag used"
-        print(f"QA Agent is DISABLED ({reason}).")
+        print(f"[QONTEX] QA Agent is DISABLED ({reason}).")
         return
 
     if state.agent is not None and not provider_changed:
@@ -73,9 +73,9 @@ def configure_agent(state, no_gemini=False, previous_config=None):
 
     state.agent = create_qa_agent(state)
     if state.agent is None:
-        print("QA Agent is DISABLED via QA_AGENT.")
+        print("[QONTEX] QA Agent is DISABLED via QA_AGENT.")
     else:
-        print(f"QA Agent loaded: {state.config.qa_agent}")
+        print(f"[QONTEX] QA Agent loaded: {state.config.qa_agent}")
 
 
 def main():
@@ -93,14 +93,14 @@ def main():
         runtime_config = apply_process_fast_safety(resolve_config(config))
         runtime_config, stream_start = hydrate_source_metadata(runtime_config)
     except FileNotFoundError:
-        print("CRITICAL ERROR: config.toml is missing!")
+        print("[QONTEX] CRITICAL ERROR: config.toml is missing!")
         exit(1)
     except ValueError as e:
-        print(e)
+        print(f"[QONTEX] {e}")
         exit(1)
 
     if runtime_config.process_fast:
-        print("PROCESS_FAST is enabled; QA, item processing, and visual/audio context are disabled.")
+        print("[QONTEX] PROCESS_FAST is enabled; QA, item processing, and visual/audio context are disabled.")
 
     log_folder = create_stream_folder(runtime_config.stream_name, stream_start)
     log_start_stop(log_folder, "start")
@@ -125,28 +125,28 @@ def main():
         if state.agent and hasattr(state.agent, "set_game_name"):
             state.agent.set_game_name(category)
 
-    print("\nPreloading AI models into VRAM... (This will pause the script until ready)")
+    print("\n[QONTEX] Preloading AI models into VRAM... (This will pause the script until ready)")
     if not args.test_chat:
-        my_streamlink.preload_models()
+        my_streamlink.preload_models(runtime_config.transcription_model)
 
     if not args.test_capture:
         from utils import preload_classifier
 
         if runtime_config.enable_question_detector:
             preload_classifier()
-    print("All models successfully loaded!\n")
+    print("[QONTEX] All models successfully loaded!\n")
 
     if args.test_chat:
         if not runtime_config.is_livestream:
-            print("Cannot test Twitch chat with a VOD/offline source.")
+            print("[QONTEX] Cannot test Twitch chat with a VOD/offline source.")
             return
-        print(f"Running standalone Twitch Chat test for {runtime_config.channel}")
+        print(f"[QONTEX] Running standalone Twitch Chat test for {runtime_config.channel}")
         listener = TwitchChatListener(
             runtime_config.twitch_username,
             os.getenv("TWITCH_TOKEN"),
             runtime_config.channel,
             log_folder,
-            category_handler=lambda category: print(f"Using Twitch category: {category}"),
+            category_handler=lambda category: print(f"[QONTEX] Using Twitch category: {category}"),
             stream_start_handler=update_stream_start,
             state=state,
         )
@@ -154,7 +154,7 @@ def main():
         return
 
     if args.test_capture:
-        print(f"Running standalone Capture test for {runtime_config.source}")
+        print(f"[QONTEX] Running standalone Capture test for {runtime_config.source}")
         my_streamlink.run_capture_loop(
             runtime_config.source,
             log_folder,
@@ -167,7 +167,7 @@ def main():
     try:
         configure_agent(state, no_gemini=args.no_gemini)
     except ValueError as e:
-        print(f"CRITICAL ERROR: {e}")
+        print(f"[QONTEX] CRITICAL ERROR: {e}")
         exit(1)
 
     def item_processor():
@@ -180,7 +180,7 @@ def main():
     processor_thread = threading.Thread(target=item_processor, daemon=True)
     processor_thread.start()
     if not runtime_config.enable_items:
-        print("Item Processing is DISABLED via config.toml.")
+        print("[QONTEX] Item Processing is DISABLED via config.toml.")
 
     def current_qa_handler(config):
         return answer_question if (state.agent and config.enable_qa) else None
@@ -192,6 +192,10 @@ def main():
 
         if state.capture_stop:
             state.capture_stop.set()
+
+        if hasattr(state, "startup_thread") and state.startup_thread and state.startup_thread.is_alive():
+            state.startup_thread.join(timeout=5)
+            state.startup_thread = None
 
         if state.capture_thread and state.capture_thread.is_alive():
             state.capture_thread.join(timeout=5)
@@ -210,70 +214,86 @@ def main():
         qa_handler_chat = qa_handler if config.enable_qa_chat else None
         qa_handler_transcript = qa_handler if config.enable_qa_transcript else None
 
-        transcript_user = config.stream_name
+        capture_stop = threading.Event()
+        state.capture_stop = capture_stop
 
-        if config.is_livestream:
-            chat_listener = TwitchChatListener(
-                config.twitch_username,
-                os.getenv("TWITCH_TOKEN"),
-                config.channel,
-                folder,
-                question_handler=qa_handler_chat,
-                category_handler=update_stream_category,
-                stream_start_handler=update_stream_start,
-                state=state,
-            )
-            listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
-            listener_thread.start()
-            state.chat_listener = chat_listener
-            state.listener_thread = listener_thread
-            print(f"Connected to {config.channel}. Listening for questions in the background...")
-        else:
-            chat_path = config.chat_path
-            if chat_path and os.path.exists(chat_path):
-                from twitch_chat import LocalChatListener
+        def delayed_start():
+            transcript_user = config.stream_name
+            
+            if config.is_livestream:
+                from twitch_chat import wait_for_stream
+                print(f"[QONTEX] Checking if {config.channel} is live...")
+                is_live = wait_for_stream(config.channel, capture_stop)
+                if capture_stop.is_set():
+                    return
+                if not is_live:
+                    print(f"[QONTEX] Could not verify stream status for {config.channel}.")
+                    return
 
-                chat_listener = LocalChatListener(
-                    chat_path,
+            if config.is_livestream:
+                chat_listener = TwitchChatListener(
+                    config.twitch_username,
+                    os.getenv("TWITCH_TOKEN"),
+                    config.channel,
                     folder,
                     question_handler=qa_handler_chat,
-                    process_fast=config.process_fast,
+                    category_handler=update_stream_category,
+                    stream_start_handler=update_stream_start,
                     state=state,
                 )
-                login_name = chat_listener.streamer_login or chat_listener.streamer_name
-                if login_name:
-                    transcript_user = login_name
-                    state.config = replace(state.config, stream_name=login_name)
-                    if state.agent and hasattr(state.agent, "streamer_name"):
-                        state.agent.streamer_name = login_name
-
                 listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
                 listener_thread.start()
                 state.chat_listener = chat_listener
                 state.listener_thread = listener_thread
-                print(f"VOD source '{config.source}' detected. Using chat file: {chat_path}")
+                print(f"[QONTEX] Connected to {config.channel}. Listening for questions in the background...")
             else:
-                state.chat_listener = None
-                state.listener_thread = None
-                print(f"VOD source '{config.source}' detected. Offline chat is disabled. (No chat file found)")
+                chat_path = config.chat_path
+                if chat_path and os.path.exists(chat_path):
+                    from twitch_chat import LocalChatListener
 
-        capture_stop = threading.Event()
-        capture_thread = threading.Thread(
-            target=my_streamlink.run_capture_loop,
-            args=(config.source, folder),
-            kwargs={
-                "process_fast": config.process_fast,
-                "question_handler": qa_handler_transcript,
-                "stop_event": capture_stop,
-                "transcript_user": transcript_user,
-                "target_fps": config.visual_context_fps,
-                "state": state,
-            },
-            daemon=True,
-        )
-        capture_thread.start()
-        state.capture_stop = capture_stop
-        state.capture_thread = capture_thread
+                    chat_listener = LocalChatListener(
+                        chat_path,
+                        folder,
+                        question_handler=qa_handler_chat,
+                        process_fast=config.process_fast,
+                        state=state,
+                    )
+                    login_name = chat_listener.streamer_login or chat_listener.streamer_name
+                    if login_name:
+                        transcript_user = login_name
+                        state.config = replace(state.config, stream_name=login_name)
+                        if state.agent and hasattr(state.agent, "streamer_name"):
+                            state.agent.streamer_name = login_name
+
+                    listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
+                    listener_thread.start()
+                    state.chat_listener = chat_listener
+                    state.listener_thread = listener_thread
+                    print(f"[QONTEX] VOD source '{config.source}' detected. Using chat file: {chat_path}")
+                else:
+                    state.chat_listener = None
+                    state.listener_thread = None
+                    print(f"[QONTEX] VOD source '{config.source}' detected. Offline chat is disabled. (No chat file found)")
+
+            capture_thread = threading.Thread(
+                target=my_streamlink.run_capture_loop,
+                args=(config.source, folder),
+                kwargs={
+                    "process_fast": config.process_fast,
+                    "question_handler": qa_handler_transcript,
+                    "stop_event": capture_stop,
+                    "transcript_user": transcript_user,
+                    "target_fps": config.visual_context_fps,
+                    "state": state,
+                },
+                daemon=True,
+            )
+            capture_thread.start()
+            state.capture_thread = capture_thread
+
+        startup_thread = threading.Thread(target=delayed_start, daemon=True)
+        startup_thread.start()
+        state.startup_thread = startup_thread
 
     start_runtime(runtime_config, log_folder)
 
@@ -295,12 +315,12 @@ def main():
                     if len(parts) > 1:
                         question = parts[1]
                         if state.config.process_fast:
-                            print("QA Agent is DISABLED while PROCESS_FAST is enabled.")
+                            print("[QONTEX] QA Agent is DISABLED while PROCESS_FAST is enabled.")
                         elif state.agent:
-                            print(f"Asking QA agent: {question}")
+                            print(f"[QONTEX] Asking QA agent: {question}")
                             direct_ask = getattr(state.agent, "direct_ask", None)
                             if not callable(direct_ask):
-                                print("Configured QA agent does not implement direct_ask.")
+                                print("[QONTEX] Configured QA agent does not implement direct_ask.")
                                 continue
                             threading.Thread(
                                 target=direct_ask,
@@ -309,9 +329,9 @@ def main():
                                 daemon=True,
                             ).start()
                         else:
-                            print("QA Agent is DISABLED.")
+                            print("[QONTEX] QA Agent is DISABLED.")
                     else:
-                        print("Usage: /ask <question>")
+                        print("[QONTEX] Usage: /ask <question>")
                     continue
 
                 if len(parts) > 1:
@@ -347,13 +367,13 @@ def main():
 
                         with open(target_path, "w", encoding="utf-8") as f:
                             f.write(content)
-                        print(f"Updated {key} to {val_str} in {target_path}")
+                        print(f"[QONTEX] Updated {key} to {val_str} in {target_path}")
                         cmd = "reload"
                     except Exception as e:
-                        print(f"Failed to update config.toml: {e}")
+                        print(f"[QONTEX] Failed to update config.toml: {e}")
                         continue
                 else:
-                    print(f"Usage: /{command} <value>")
+                    print(f"[QONTEX] Usage: /{command} <value>")
                     continue
 
             if cmd in ("status", "list"):
@@ -362,8 +382,12 @@ def main():
                 print(f"QA Agent: {'ACTIVE' if state.agent else 'OFFLINE'}")
                 print(f"Source: {state.config.source_kind} {state.config.source}")
                 print(f"Chat File: {state.config.chat_path or 'none'}")
-                print(f"Capture: {'ACTIVE' if state.capture_thread and state.capture_thread.is_alive() else 'OFFLINE'}")
-                print(f"Chat Listener: {'ACTIVE' if state.chat_listener else 'OFFLINE'}")
+                if hasattr(state, "startup_thread") and state.startup_thread and state.startup_thread.is_alive() and not state.capture_thread:
+                    print(f"Capture: WAITING FOR STREAM")
+                    print(f"Chat Listener: WAITING FOR STREAM")
+                else:
+                    print(f"Capture: {'ACTIVE' if state.capture_thread and state.capture_thread.is_alive() else 'OFFLINE'}")
+                    print(f"Chat Listener: {'ACTIVE' if state.chat_listener else 'OFFLINE'}")
 
                 chat_listener = state.chat_listener
                 if not chat_listener or not chat_listener.question_queue:
@@ -414,7 +438,7 @@ def main():
                     new_config = apply_process_fast_safety(resolve_config(reload_config()))
                     new_config, new_stream_start = hydrate_source_metadata(new_config)
                 except Exception as e:
-                    print(f"Config reload failed: {e}\n")
+                    print(f"[QONTEX] Config reload failed: {e}\n")
                     continue
 
                 old_config = state.config
@@ -454,29 +478,29 @@ def main():
                     try:
                         configure_agent(state, no_gemini=args.no_gemini, previous_config=old_config)
                     except ValueError as e:
-                        print(f"QA agent reload failed: {e}")
+                        print(f"[QONTEX] QA agent reload failed: {e}")
                         state.agent = None
 
                     start_runtime(new_config, new_log_folder)
-                    print(f"Reloaded config and restarted stream workers for {new_config.source}.\n")
+                    print(f"[QONTEX] Reloaded config and restarted stream workers for {new_config.source}.\n")
                 else:
                     state.refresh_config(new_config)
                     try:
                         configure_agent(state, no_gemini=args.no_gemini, previous_config=old_config)
                     except ValueError as e:
-                        print(f"QA agent reload failed: {e}")
+                        print(f"[QONTEX] QA agent reload failed: {e}")
                         state.agent = None
-                    print("Reloaded config without restarting stream workers.\n")
+                    print("[QONTEX] Reloaded config without restarting stream workers.\n")
 
             elif cmd == "quit":
                 uptime = time.time() - state.clock_start_wall
                 log_start_stop(state.log_folder, "stop", uptime=uptime)
                 stop_runtime()
-                print("Shutting down...")
+                print("[QONTEX] Shutting down...")
                 break
 
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt received. Shutting down...")
+        print("\n[QONTEX] Keyboard interrupt received. Shutting down...")
         uptime = time.time() - state.clock_start_wall
         log_start_stop(state.log_folder, "stop", uptime=uptime)
         stop_runtime()

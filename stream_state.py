@@ -93,6 +93,8 @@ class StreamConfig:
     log_answers_separately: bool = False
     qa_agent: str = "gemini"
     qa_model: Optional[str] = None
+    transcription_model: str = "faster-whisper"
+    mega_asr_path: Optional[str] = None
 
     @property
     def is_vod(self):
@@ -150,7 +152,7 @@ class StreamConfig:
             game_name=config.get("GAME_NAME") or config.get("GAME") or stream_name,
             twitch_username=config.get("TWITCH_USERNAME"),
             chat_path=chat_path,
-            process_fast=config.get("PROCESS_FAST", False),
+            process_fast=config.get("PROCESS_FAST", False) if is_local_file else False,
             enable_question_detector=config.get("ENABLE_QUESTION_DETECTOR", True),
             question_detector_type=config.get("QUESTION_DETECTOR_TYPE", "standard"),
             enable_qa=config.get("ENABLE_QA", True),
@@ -166,6 +168,8 @@ class StreamConfig:
             log_answers_separately=config.get("LOG_ANSWERS_SEPARATELY", False),
             qa_agent=str(config.get("QA_AGENT") or "gemini").strip(),
             qa_model=config.get("QA_MODEL") or None,
+            transcription_model=config.get("TRANSCRIPTION_MODEL", "faster-whisper"),
+            mega_asr_path=config.get("MEGA_ASR_PATH") or None,
         )
 
 
@@ -181,6 +185,7 @@ class StreamState:
     agent: Any = None
     chat_listener: Any = None
     listener_thread: Optional[threading.Thread] = None
+    startup_thread: Optional[threading.Thread] = None
     capture_thread: Optional[threading.Thread] = None
     capture_stop: Optional[threading.Event] = None
     enable_items: bool = False

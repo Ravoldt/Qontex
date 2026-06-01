@@ -102,12 +102,12 @@ class TwitchChatListener(commands.Bot):
             self._event_loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
 
     async def event_ready(self):
-        print(f"Logged in to Twitch as | {self.bot_nick}")
+        print(f"[QONTEX] Logged in to Twitch as | {self.bot_nick}")
 
         # 1. Fetch the streamer's user info to get their numeric Broadcaster ID
         users = await self.fetch_users(logins=[self.channel])
         if not users:
-            print(f"Could not find Twitch channel: {self.channel}")
+            print(f"[QONTEX] Could not find Twitch channel: {self.channel}")
             return
         broadcaster_id = users[0].id
 
@@ -117,7 +117,7 @@ class TwitchChatListener(commands.Bot):
         )
 
         await self.subscribe_websocket(payload=subscription)
-        print(f"Successfully subscribed to live chat for {self.channel}!")
+        print(f"[QONTEX] Successfully subscribed to live chat for {self.channel}!")
 
         if not self._info_loop_started:
             self._info_loop_started = True
@@ -180,7 +180,7 @@ class TwitchChatListener(commands.Bot):
             channel_info = await self.fetch_channel(self.channel)
             return getattr(channel_info, "game_name", None), None
         except Exception as e:
-            print(f"\r[!] Twitch stream info lookup failed: {e}")
+            print(f"\r[QONTEX] [!] Twitch stream info lookup failed: {e}")
         return None, None
 
 
@@ -278,10 +278,10 @@ class LocalChatListener:
 
             self.messages.sort(key=lambda x: x["timestamp"])
         except Exception as e:
-            print(f"Error loading local chat JSON: {e}")
+            print(f"[QONTEX] Error loading local chat JSON: {e}")
 
     def listen(self):
-        print(f"Loaded {len(self.messages)} chat messages from {self.json_path}")
+        print(f"[QONTEX] Loaded {len(self.messages)} chat messages from {self.json_path}")
         msg_idx = 0
 
         try:
@@ -340,6 +340,76 @@ class LocalChatListener:
 
         return streamcapture.current_video_timestamp
 
+class StreamOnlineWaiter(twitchio.Client):
+    def __init__(self, channel):
+        self.channel = channel.lstrip("#").lower()
+        self.twitch_token = self._normalize_token(os.getenv("TWITCH_TOKEN"))
+        self.is_live = False
+        self.waiter_stop = asyncio.Event()
+        super().__init__(
+            client_id=os.getenv("TWITCH_CLIENT_ID"),
+            client_secret=os.getenv("TWITCH_CLIENT_SECRET")
+        )
+
+    def _normalize_token(self, token):
+        if not token:
+            return ""
+        token = token.strip()
+        for prefix in ("oauth:", "OAuth ", "Bearer "):
+            if token.startswith(prefix):
+                return token[len(prefix):]
+        return token
+
+    async def setup_hook(self):
+        refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
+        if not refresh_token:
+            raise ValueError("TWITCH_REFRESH_TOKEN is required for EventSub.")
+        await self.add_token(self.twitch_token, refresh_token)
+
+    async def event_ready(self):
+        users = await self.fetch_users(logins=[self.channel])
+        if not users:
+            print(f"\n[QONTEX] [!] Could not find channel: {self.channel}")
+            self.waiter_stop.set()
+            return
+
+        broadcaster_id = users[0].id
+        streams = await self.fetch_streams(user_ids=[broadcaster_id])
+        if streams:
+            self.is_live = True
+            self.waiter_stop.set()
+            return
+
+        print(f"\n[QONTEX] [*] {self.channel} is currently offline. Waiting for stream to go live...")
+        try:
+            sub = twitchio.eventsub.StreamOnlineSubscription(broadcaster_user_id=broadcaster_id)
+            await self.subscribe_websocket(payload=sub)
+        except Exception as e:
+            print(f"[QONTEX] [!] EventSub subscription failed: {e}")
+            self.waiter_stop.set()
+
+    async def event_eventsub_notification_stream_start(self, payload):
+        print(f"\n[QONTEX] [*] Stream online event received for {payload.broadcaster.name}! Starting main script...")
+        self.is_live = True
+        self.waiter_stop.set()
+
+def wait_for_stream(channel, stop_event):
+    waiter = StreamOnlineWaiter(channel)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    async def run_waiter():
+        loop.create_task(waiter.start())
+        while not waiter.waiter_stop.is_set() and not stop_event.is_set():
+            await asyncio.sleep(0.5)
+        await waiter.close()
+        
+    try:
+        loop.run_until_complete(run_waiter())
+    except asyncio.CancelledError:
+        pass
+    return waiter.is_live
+
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
@@ -353,10 +423,10 @@ if __name__ == "__main__":
     PASS = os.getenv("TWITCH_TOKEN")
 
     if not CHANNEL:
-        print("Please set the CHANNEL in config.toml!")
+        print("[QONTEX] Please set the CHANNEL in config.toml!")
         exit(1)
 
     log_folder = create_stream_folder(CHANNEL.lstrip("#"), datetime.datetime.now())
     listener = TwitchChatListener(NICK, PASS, CHANNEL, log_folder)
-    print(f"Testing Twitch chat on #{CHANNEL.lstrip('#')}...")
+    print(f"[QONTEX] Testing Twitch chat on #{CHANNEL.lstrip('#')}...")
     listener.listen()
