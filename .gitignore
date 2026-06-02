@@ -1,15 +1,24 @@
+# Environment and local settings
 .env
 .vscode/*
 !.vscode/extensions.json
 !.vscode/tasks.json
 !.vscode/launch.json
+__pycache__/
+.tio.tokens.json
+.venv/
+local.toml
+
+# Dev tools and testing
+frame_bundler.py
+marlin.py
+dev/
+
+
+# Generated and temporary files
 lore/
 video/
 logs/
-__pycache__/
-local.toml
-.tio.tokens.json
-dev/
-downloader.py
-.venv/
+
+# Mega-ASR
 Mega-ASR/

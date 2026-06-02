@@ -12,6 +12,8 @@ PYTORCH_CUDA_WHEELS = (
 )
 
 PREFERRED_CUDA_MAJOR = 12
+PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
+MEGA_ASR_REQUIREMENTS = os.path.join("Mega-ASR", "requirements.txt")
 
 
 def run(command, check=True, capture_output=False):
@@ -124,12 +126,67 @@ def install_pytorch(wheel_tag, dry_run=False):
         run(command)
 
 
-def install_requirements(dry_run=False):
-    command = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
-    print("Installing remaining requirements:")
+def requirement_name(requirement):
+    match = re.match(r"\s*([A-Za-z0-9_.-]+)", requirement)
+    return match.group(1).lower().replace("_", "-") if match else ""
+
+
+def read_requirements(path, excluded_packages=None):
+    excluded_packages = {name.lower().replace("_", "-") for name in (excluded_packages or set())}
+    requirements = []
+    skipped = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            name = requirement_name(line)
+            if name in excluded_packages:
+                skipped.append(line)
+                continue
+
+            requirements.append(line)
+
+    return requirements, skipped
+
+
+def install_requirements_file(path, label, dry_run=False, excluded_packages=None):
+    if excluded_packages:
+        requirements, skipped = read_requirements(path, excluded_packages)
+        if skipped:
+            print(f"Skipping {label} PyTorch pins because PyTorch was installed above:")
+            for item in skipped:
+                print(f"  {item}")
+        if not requirements:
+            print(f"No installable {label} requirements found in {path}.")
+            return
+        command = [sys.executable, "-m", "pip", "install", *requirements]
+    else:
+        command = [sys.executable, "-m", "pip", "install", "-r", path]
+
+    print(f"Installing {label} requirements:")
     print(" ".join(command))
     if not dry_run:
         run(command)
+
+
+def install_requirements(dry_run=False):
+    install_requirements_file("requirements.txt", "Qontex", dry_run=dry_run)
+
+
+def install_mega_asr_requirements(dry_run=False):
+    if not os.path.exists(MEGA_ASR_REQUIREMENTS):
+        print(f"Mega-ASR requirements not found at {MEGA_ASR_REQUIREMENTS}; skipping.")
+        return
+
+    install_requirements_file(
+        MEGA_ASR_REQUIREMENTS,
+        "Mega-ASR",
+        dry_run=dry_run,
+        excluded_packages=PYTORCH_PACKAGES,
+    )
 
 
 def verify_torch(dry_run=False):
@@ -148,6 +205,7 @@ def main():
     parser = argparse.ArgumentParser(description="Install Qontex dependencies with automatic PyTorch CUDA selection.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU-only PyTorch.")
     parser.add_argument("--cuda", choices=[tag for _, tag in PYTORCH_CUDA_WHEELS], help="Force a specific PyTorch CUDA wheel.")
+    parser.add_argument("--skip-mega-asr", action="store_true", help="Do not install Mega-ASR requirements.")
     parser.add_argument("--dry-run", action="store_true", help="Print install commands without running them.")
     args = parser.parse_args()
 
@@ -170,6 +228,10 @@ def main():
 
     install_pytorch(wheel_tag, dry_run=args.dry_run)
     install_requirements(dry_run=args.dry_run)
+    if args.skip_mega_asr:
+        print("Skipping Mega-ASR requirements by request.")
+    else:
+        install_mega_asr_requirements(dry_run=args.dry_run)
     verify_torch(dry_run=args.dry_run)
 
 

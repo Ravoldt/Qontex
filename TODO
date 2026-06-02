@@ -1,0 +1,19 @@
+**HIGH PRIORITY**
+
+optimize megaASR to use less vram
+clean up/remove faster whisper pipeline
+change question detection to more advance information request detection
+bypass streamlink obfuscation layer and get the m3u8 playlist directly for more accurate transcript/chat syncing
+
+**LOW PRIORITY**
+
+move from config.toml to config.ini for better readability
+move from terminal output to a web based frontend
+add emote integration for twitch, 7tv, BTTV, and FFZ
+add a feature that enables the QA agent to get game specific wiki knowledge via tool calling or context caching
+add a database to allow the QA agent to dynamically request more context
+add a config option to set the prefered language for transcription
+make the code more modular so transription, QA, and question detection models can easily be swapped
+change the default environment from windows to linux for compatibility and efficiency
+add speaker diarization
+remove unused "/" commands and clean up terminal output

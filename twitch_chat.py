@@ -7,7 +7,22 @@ import threading
 import twitchio
 from twitchio.ext import commands
 
-from utils import Message, create_stream_folder, get_config_value, is_likely_question, load_config, log_json, log_message, shared_deque, refresh_twitch_token
+from utils import (
+    Message,
+    TwitchCredentialsError,
+    TWITCH_REQUIRED_SCOPES,
+    create_stream_folder,
+    format_twitch_scopes,
+    get_config_value,
+    is_likely_question,
+    load_config,
+    log_json,
+    log_message,
+    normalize_twitch_token,
+    shared_deque,
+    refresh_twitch_token,
+    twitch_reauthorization_hint,
+)
 
 
 class TwitchChatListener(commands.Bot):
@@ -21,6 +36,8 @@ class TwitchChatListener(commands.Bot):
         question_handler=None,
         category_handler=None,
         stream_start_handler=None,
+        stream_online_handler=None,
+        stream_offline_handler=None,
         state=None,
     ):
         self.state = state
@@ -31,8 +48,13 @@ class TwitchChatListener(commands.Bot):
         self.question_handler = question_handler
         self.category_handler = category_handler
         self.stream_start_handler = stream_start_handler
+        self.stream_online_handler = stream_online_handler
+        self.stream_offline_handler = stream_offline_handler
         self.question_queue = []
         self.stream_category = None
+        self.stream_active = True
+        self.broadcaster_id = None
+        self._last_live = None
         self._fallback_start = time.time()
         self._info_loop_started = False
         self._info_task = None
@@ -48,38 +70,38 @@ class TwitchChatListener(commands.Bot):
         )
 
     def _normalize_token(self, token):
+        token = normalize_twitch_token(token)
         if not token:
-            raise ValueError("TWITCH_TOKEN is required for Twitch chat.")
-        token = token.strip()
-        if token.startswith("oauth:"):
-            return token.removeprefix("oauth:")
-        if token.startswith("OAuth "):
-            return token.removeprefix("OAuth ")
-        if token.startswith("Bearer "):
-            return token.removeprefix("Bearer ")
+            raise TwitchCredentialsError(f"TWITCH_TOKEN is required for Twitch chat. {twitch_reauthorization_hint()}")
         return token
 
     async def setup_hook(self):
         refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
         if not refresh_token:
-            raise ValueError("TWITCH_REFRESH_TOKEN is required for Twitch EventSub chat.")
+            raise TwitchCredentialsError(
+                f"TWITCH_REFRESH_TOKEN is required for Twitch EventSub chat. {twitch_reauthorization_hint()}"
+            )
 
         validated = await self.add_token(self.twitch_token, refresh_token)
         client_id = os.getenv("TWITCH_CLIENT_ID")
         if validated.client_id != client_id:
-            raise ValueError(
+            raise TwitchCredentialsError(
                 "TWITCH_TOKEN was issued for client ID "
                 f"{validated.client_id}, but TWITCH_CLIENT_ID is {client_id}."
             )
 
         if validated.user_id != self.bot_id:
-            raise ValueError(
+            raise TwitchCredentialsError(
                 "TWITCH_TOKEN belongs to user ID "
                 f"{validated.user_id}, but TWITCH_BOT_ID is {self.bot_id}."
             )
 
-        if "user:read:chat" not in validated.scopes:
-            raise ValueError("TWITCH_TOKEN must include the user:read:chat scope.")
+        missing_scopes = TWITCH_REQUIRED_SCOPES - set(validated.scopes)
+        if missing_scopes:
+            raise TwitchCredentialsError(
+                f"TWITCH_TOKEN must include these scopes: {format_twitch_scopes(missing_scopes)}. "
+                f"{twitch_reauthorization_hint()}"
+            )
 
     def is_likely_question(self, message, msg_type="chat"):
         return is_likely_question(message, msg_type)
@@ -91,9 +113,15 @@ class TwitchChatListener(commands.Bot):
         if self.question_handler:
             threading.Thread(target=self.question_handler, args=(msg,), daemon=True).start()
 
+    def set_stream_active(self, active):
+        self.stream_active = bool(active)
+
     def listen(self):
         asyncio.set_event_loop(self._event_loop)
-        self._event_loop.run_until_complete(self.start())
+        try:
+            self._event_loop.run_until_complete(self.start())
+        except TwitchCredentialsError as e:
+            print(f"[QONTEX] Twitch chat/EventSub startup failed: {e}")
 
     def stop(self):
         if self._event_loop.is_running():
@@ -110,6 +138,7 @@ class TwitchChatListener(commands.Bot):
             print(f"[QONTEX] Could not find Twitch channel: {self.channel}")
             return
         broadcaster_id = users[0].id
+        self.broadcaster_id = broadcaster_id
 
         subscription = twitchio.eventsub.ChatMessageSubscription(
             broadcaster_user_id=broadcaster_id,
@@ -118,6 +147,15 @@ class TwitchChatListener(commands.Bot):
 
         await self.subscribe_websocket(payload=subscription)
         print(f"[QONTEX] Successfully subscribed to live chat for {self.channel}!")
+
+        await self.subscribe_websocket(
+            payload=twitchio.eventsub.StreamOnlineSubscription(broadcaster_user_id=broadcaster_id),
+            as_bot=True,
+        )
+        await self.subscribe_websocket(
+            payload=twitchio.eventsub.StreamOfflineSubscription(broadcaster_user_id=broadcaster_id),
+            as_bot=True,
+        )
 
         if not self._info_loop_started:
             self._info_loop_started = True
@@ -142,9 +180,27 @@ class TwitchChatListener(commands.Bot):
         else:
             shared_deque.add_message(msg)
 
-        should_detect_question = self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+        should_detect_question = self.stream_active and (
+            self.question_handler or get_config_value("LOG_QUESTION_DETECTIONS", True)
+        )
         if should_detect_question and self.is_likely_question(msg.text, msg.type):
             self.handle_question(msg)
+
+    async def event_stream_online(self, payload):
+        self.set_stream_active(True)
+        self._last_live = True
+        print(f"\n[QONTEX] [*] Stream online event received for {payload.broadcaster.name}.")
+        if self.stream_start_handler:
+            self.stream_start_handler(payload.started_at)
+        if self.stream_online_handler:
+            threading.Thread(target=self.stream_online_handler, args=(payload.started_at,), daemon=True).start()
+
+    async def event_stream_offline(self, payload):
+        self.set_stream_active(False)
+        self._last_live = False
+        print(f"\n[QONTEX] [*] Stream offline event received for {payload.broadcaster.name}.")
+        if self.stream_offline_handler:
+            threading.Thread(target=self.stream_offline_handler, args=("eventsub",), daemon=True).start()
 
     async def refresh_stream_info_loop(self):
         try:
@@ -162,8 +218,19 @@ class TwitchChatListener(commands.Bot):
                 self.category_handler(category)
             print(f"\rTwitch category: {category}")
 
-        if started_at and self.stream_start_handler:
-            self.stream_start_handler(started_at.timestamp())
+        is_live = started_at is not None
+        initial_state = self._last_live is None
+        changed_state = not initial_state and self._last_live != is_live
+        self._last_live = is_live
+        self.set_stream_active(is_live)
+
+        if is_live:
+            if self.stream_start_handler:
+                self.stream_start_handler(started_at)
+            if (initial_state or changed_state) and self.stream_online_handler:
+                threading.Thread(target=self.stream_online_handler, args=(started_at,), daemon=True).start()
+        elif changed_state and self.stream_offline_handler:
+            threading.Thread(target=self.stream_offline_handler, args=("poll",), daemon=True).start()
         return category, started_at
 
     async def fetch_stream_info(self):
@@ -177,11 +244,27 @@ class TwitchChatListener(commands.Bot):
                 if streams:
                     return getattr(streams[0], "game_name", None), getattr(streams[0], "started_at", None)
 
-            channel_info = await self.fetch_channel(self.channel)
+            broadcaster_id = await self.resolve_broadcaster_id()
+            if not broadcaster_id:
+                return None, None
+
+            channel_info = await self.fetch_channel(broadcaster_id)
             return getattr(channel_info, "game_name", None), None
         except Exception as e:
             print(f"\r[QONTEX] [!] Twitch stream info lookup failed: {e}")
         return None, None
+
+    async def resolve_broadcaster_id(self):
+        if self.broadcaster_id:
+            return self.broadcaster_id
+
+        users = await self.fetch_users(logins=[self.channel])
+        if not users:
+            print(f"\r[QONTEX] [!] Could not find Twitch channel: {self.channel}")
+            return None
+
+        self.broadcaster_id = users[0].id
+        return self.broadcaster_id
 
 
 class LocalChatListener:
@@ -348,23 +431,38 @@ class StreamOnlineWaiter(twitchio.Client):
         self.waiter_stop = asyncio.Event()
         super().__init__(
             client_id=os.getenv("TWITCH_CLIENT_ID"),
-            client_secret=os.getenv("TWITCH_CLIENT_SECRET")
+            client_secret=os.getenv("TWITCH_CLIENT_SECRET"),
+            bot_id=os.getenv("TWITCH_BOT_ID"),
         )
 
     def _normalize_token(self, token):
-        if not token:
-            return ""
-        token = token.strip()
-        for prefix in ("oauth:", "OAuth ", "Bearer "):
-            if token.startswith(prefix):
-                return token[len(prefix):]
-        return token
+        return normalize_twitch_token(token)
 
     async def setup_hook(self):
         refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
         if not refresh_token:
-            raise ValueError("TWITCH_REFRESH_TOKEN is required for EventSub.")
-        await self.add_token(self.twitch_token, refresh_token)
+            raise TwitchCredentialsError(f"TWITCH_REFRESH_TOKEN is required for EventSub. {twitch_reauthorization_hint()}")
+        validated = await self.add_token(self.twitch_token, refresh_token)
+        client_id = os.getenv("TWITCH_CLIENT_ID")
+        if validated.client_id != client_id:
+            raise TwitchCredentialsError(
+                "TWITCH_TOKEN was issued for client ID "
+                f"{validated.client_id}, but TWITCH_CLIENT_ID is {client_id}."
+            )
+
+        bot_id = os.getenv("TWITCH_BOT_ID")
+        if bot_id and validated.user_id != bot_id:
+            raise TwitchCredentialsError(
+                "TWITCH_TOKEN belongs to user ID "
+                f"{validated.user_id}, but TWITCH_BOT_ID is {bot_id}."
+            )
+
+        missing_scopes = TWITCH_REQUIRED_SCOPES - set(validated.scopes)
+        if missing_scopes:
+            raise TwitchCredentialsError(
+                f"TWITCH_TOKEN must include these scopes: {format_twitch_scopes(missing_scopes)}. "
+                f"{twitch_reauthorization_hint()}"
+            )
 
     async def event_ready(self):
         users = await self.fetch_users(logins=[self.channel])
@@ -383,12 +481,17 @@ class StreamOnlineWaiter(twitchio.Client):
         print(f"\n[QONTEX] [*] {self.channel} is currently offline. Waiting for stream to go live...")
         try:
             sub = twitchio.eventsub.StreamOnlineSubscription(broadcaster_user_id=broadcaster_id)
-            await self.subscribe_websocket(payload=sub)
+            await self.subscribe_websocket(payload=sub, as_bot=True)
         except Exception as e:
             print(f"[QONTEX] [!] EventSub subscription failed: {e}")
             self.waiter_stop.set()
 
     async def event_eventsub_notification_stream_start(self, payload):
+        print(f"\n[QONTEX] [*] Stream online event received for {payload.broadcaster.name}! Starting main script...")
+        self.is_live = True
+        self.waiter_stop.set()
+
+    async def event_stream_online(self, payload):
         print(f"\n[QONTEX] [*] Stream online event received for {payload.broadcaster.name}! Starting main script...")
         self.is_live = True
         self.waiter_stop.set()
@@ -415,7 +518,11 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
 
     load_dotenv()
-    refresh_twitch_token()
+    try:
+        refresh_twitch_token(strict=True)
+    except TwitchCredentialsError as e:
+        print(f"[QONTEX] Twitch credentials error: {e}")
+        exit(1)
     config = load_config()
 
     NICK = config.get("TWITCH_USERNAME")

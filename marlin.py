@@ -44,6 +44,33 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 processor = AutoProcessor.from_pretrained("NemoStation/Marlin-2B", trust_remote_code=True)
 
+
+def resolve_pad_token_id(model, processor):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None and getattr(tokenizer, "pad_token_id", None) is not None:
+        return tokenizer.pad_token_id
+
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None and getattr(generation_config, "pad_token_id", None) is not None:
+        return generation_config.pad_token_id
+
+    if tokenizer is not None and getattr(tokenizer, "eos_token_id", None) is not None:
+        return tokenizer.eos_token_id
+
+    if generation_config is not None:
+        eos_token_id = getattr(generation_config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple)):
+            return eos_token_id[0] if eos_token_id else None
+        return eos_token_id
+
+    return None
+
+
+pad_token_id = resolve_pad_token_id(model, processor)
+generation_config = getattr(model, "generation_config", None)
+if pad_token_id is not None and generation_config is not None and getattr(generation_config, "pad_token_id", None) is None:
+    generation_config.pad_token_id = pad_token_id
+
 messages = [{"role": "user", "content": [
     {"type": "video", "video": "/mnt/d/qontexvods/part11.mp4"},
     {"type": "text", "text": "Provide a spatial description of this clip followed by time-ranged events.\nFor each event, give the time range as <start - end> and a short description."},
@@ -53,8 +80,12 @@ inputs = processor.apply_chat_template(
     return_tensors="pt", return_dict=True,
 ).to(model.device)
 
+generation_kwargs = {"max_new_tokens": 512, "do_sample": False}
+if pad_token_id is not None:
+    generation_kwargs["pad_token_id"] = pad_token_id
+
 with torch.inference_mode():
-    out = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+    out = model.generate(**inputs, **generation_kwargs)
 out = out[:, inputs["input_ids"].shape[1]:]
 text = processor.batch_decode(out, skip_special_tokens=True)[0]
 print(text)

@@ -188,6 +188,8 @@ class StreamState:
     startup_thread: Optional[threading.Thread] = None
     capture_thread: Optional[threading.Thread] = None
     capture_stop: Optional[threading.Event] = None
+    capture_process: Any = None
+    stream_live: bool = False
     enable_items: bool = False
     current_video_timestamp: float = 0.0
     chat_processing_timestamp: Optional[float] = None

@@ -1,7 +1,9 @@
 import os
+import gc
 import json
 import re
 import subprocess
+import urllib.error
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -14,6 +16,34 @@ _log_lock = threading.Lock()
 _config_lock = threading.Lock()
 _classifier = None
 _config = {}
+TWITCH_REQUIRED_SCOPES = {"user:read:chat", "user:bot"}
+
+
+class TwitchCredentialsError(ValueError):
+    """Raised when Twitch credentials are missing, stale, or scoped incorrectly."""
+
+
+def normalize_twitch_token(token):
+    if not token:
+        return ""
+    token = token.strip()
+    for prefix in ("oauth:", "OAuth ", "Bearer "):
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return token
+
+
+def format_twitch_scopes(scopes=None):
+    return ", ".join(sorted(TWITCH_REQUIRED_SCOPES if scopes is None else scopes))
+
+
+def twitch_reauthorization_hint():
+    scopes = " ".join(sorted(TWITCH_REQUIRED_SCOPES))
+    return (
+        f"Re-authorize the Twitch app with these scopes: {scopes}. "
+        "Then update TWITCH_TOKEN and TWITCH_REFRESH_TOKEN in .env. "
+        "A refresh token that was originally authorized without a scope cannot add it later."
+    )
 
 def _read_toml(path):
     try:
@@ -205,6 +235,23 @@ def preload_classifier():
             dtype=dtype,
             token=os.getenv("HF_TOKEN"))
 
+def unload_classifier():
+    """Release the question classifier and return GPU memory to PyTorch."""
+    global _classifier
+
+    if _classifier is None:
+        return
+
+    _classifier = None
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 def is_likely_question(message, msg_type="chat"):
     """Return True when a chat or transcript message looks like a question."""
     if not get_config_value("ENABLE_QUESTION_DETECTOR", True):
@@ -328,15 +375,24 @@ def cut_video_segment(input_path, output_path, start_time, duration):
     except subprocess.CalledProcessError as e:
         print("[QONTEX] Error cutting video: {}".format(e))
 
-def refresh_twitch_token():
-    """Validate the current Twitch token and refresh it if expired."""
+def refresh_twitch_token(strict=False):
+    """Validate the current Twitch token and refresh it if expired.
+
+    When strict is true, raise TwitchCredentialsError if live Twitch
+    EventSub credentials cannot satisfy the required scopes.
+    """
     token = os.getenv("TWITCH_TOKEN")
     client_id = os.getenv("TWITCH_CLIENT_ID")
     client_secret = os.getenv("TWITCH_CLIENT_SECRET")
+    bot_id = os.getenv("TWITCH_BOT_ID")
     refresh_token = os.getenv("TWITCH_REFRESH_TOKEN")
 
-    clean_token = token.replace("oauth:", "") if token else ""
-    required_scopes = {"user:read:chat"}
+    clean_token = normalize_twitch_token(token)
+    required_scopes = TWITCH_REQUIRED_SCOPES
+    last_error = None
+
+    if strict and not clean_token:
+        raise TwitchCredentialsError(f"TWITCH_TOKEN is required for Twitch chat. {twitch_reauthorization_hint()}")
 
     if clean_token:
         req = urllib.request.Request("https://id.twitch.tv/oauth2/validate")
@@ -346,17 +402,48 @@ def refresh_twitch_token():
                 if response.getcode() == 200:
                     data = json.loads(response.read().decode("utf-8"))
                     scopes = set(data.get("scopes", []))
-                    if required_scopes.issubset(scopes):
+                    token_client_id = data.get("client_id")
+                    token_user_id = data.get("user_id")
+                    client_matches = not client_id or token_client_id == client_id
+                    user_matches = not bot_id or token_user_id == bot_id
+
+                    if required_scopes.issubset(scopes) and client_matches and user_matches:
                         return token
+                    elif strict and not client_matches:
+                        last_error = (
+                            "TWITCH_TOKEN was issued for client ID "
+                            f"{token_client_id}, but TWITCH_CLIENT_ID is {client_id}."
+                        )
+                    elif strict and not user_matches:
+                        last_error = (
+                            "TWITCH_TOKEN belongs to user ID "
+                            f"{token_user_id}, but TWITCH_BOT_ID is {bot_id}."
+                        )
                     else:
-                        missing = required_scopes - scopes
+                        missing_scopes = required_scopes - scopes
+                        missing = format_twitch_scopes(missing_scopes)
                         print(f"[QONTEX] [*] Twitch token is valid but missing required scopes: {missing}")
+                        last_error = (
+                            f"TWITCH_TOKEN must include these scopes: {missing}. "
+                            f"{twitch_reauthorization_hint()}"
+                        )
                         # Token is incomplete, proceed to refresh below
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as e:
+            last_error = f"Twitch rejected TWITCH_TOKEN during validation: {e}"
             pass  # Token is invalid, proceed to refresh
+        except urllib.error.URLError as e:
+            last_error = f"Could not validate TWITCH_TOKEN with Twitch: {e}"
 
     if not all([client_id, client_secret, refresh_token]):
-        print("[QONTEX] [!] Twitch token may be expired or incomplete. Add TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_REFRESH_TOKEN to .env to enable auto-refresh.")
+        message = (
+            "Twitch token may be expired or incomplete. Add TWITCH_CLIENT_ID, "
+            "TWITCH_CLIENT_SECRET, and TWITCH_REFRESH_TOKEN to .env to enable auto-refresh."
+        )
+        print(f"[QONTEX] [!] {message}")
+        if strict:
+            if last_error:
+                message = f"{last_error}\n{message}"
+            raise TwitchCredentialsError(message)
         return token
 
     print("[QONTEX] [*] Attempting to refresh Twitch token to obtain full credentials...")
@@ -365,7 +452,7 @@ def refresh_twitch_token():
         "client_secret": client_secret,
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "scope": " ".join(required_scopes)
+        "scope": " ".join(sorted(required_scopes))
     }).encode("utf-8")
 
     req = urllib.request.Request("https://id.twitch.tv/oauth2/token", data=data)
@@ -374,6 +461,18 @@ def refresh_twitch_token():
             result = json.loads(response.read().decode("utf-8"))
             new_access_token = result.get("access_token")
             new_refresh_token = result.get("refresh_token")
+            scope_payload = result.get("scope", [])
+            new_scopes = set(scope_payload.split()) if isinstance(scope_payload, str) else set(scope_payload)
+
+            if new_access_token and not required_scopes.issubset(new_scopes):
+                missing = format_twitch_scopes(required_scopes - new_scopes)
+                print(f"[QONTEX] [!] Refreshed Twitch token is missing required scopes: {missing}")
+                print("[QONTEX] [!] Re-authorize the Twitch app with the updated scopes, then update TWITCH_TOKEN and TWITCH_REFRESH_TOKEN.")
+                if strict:
+                    raise TwitchCredentialsError(
+                        f"TWITCH_TOKEN must include these scopes: {missing}. {twitch_reauthorization_hint()}"
+                    )
+                return token
 
             if new_access_token:
                 try:
@@ -390,7 +489,13 @@ def refresh_twitch_token():
                     os.environ["TWITCH_REFRESH_TOKEN"] = new_refresh_token
                 print("[QONTEX] [*] Twitch token successfully refreshed!")
                 return new_access_token
+    except TwitchCredentialsError:
+        raise
     except Exception as e:
+        last_error = f"Failed to refresh Twitch token: {e}"
         print(f"[QONTEX] [!] Failed to refresh Twitch token: {e}")
+
+    if strict:
+        raise TwitchCredentialsError(last_error or twitch_reauthorization_hint())
 
     return token

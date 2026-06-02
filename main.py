@@ -12,7 +12,16 @@ from dotenv import load_dotenv
 from qa_agent import create_qa_agent
 from stream_state import StreamConfig, StreamState
 from twitch_chat import TwitchChatListener
-from utils import create_stream_folder, flush_json_buffer, load_config, log_start_stop, refresh_twitch_token, reload_config, shared_deque
+from utils import (
+    TwitchCredentialsError,
+    create_stream_folder,
+    flush_json_buffer,
+    load_config,
+    log_start_stop,
+    refresh_twitch_token,
+    reload_config,
+    shared_deque,
+)
 import streamcapture as my_streamlink
 
 
@@ -86,7 +95,6 @@ def main():
     args = parser.parse_args()
 
     load_dotenv()
-    refresh_twitch_token()
 
     try:
         config = load_config()
@@ -98,6 +106,13 @@ def main():
     except ValueError as e:
         print(f"[QONTEX] {e}")
         exit(1)
+
+    if runtime_config.is_livestream:
+        try:
+            refresh_twitch_token(strict=True)
+        except TwitchCredentialsError as e:
+            print(f"[QONTEX] Twitch credentials error: {e}")
+            exit(1)
 
     if runtime_config.process_fast:
         print("[QONTEX] PROCESS_FAST is enabled; QA, item processing, and visual/audio context are disabled.")
@@ -125,16 +140,23 @@ def main():
         if state.agent and hasattr(state.agent, "set_game_name"):
             state.agent.set_game_name(category)
 
-    print("\n[QONTEX] Preloading AI models into VRAM... (This will pause the script until ready)")
-    if not args.test_chat:
+    defer_live_models = runtime_config.is_livestream and not args.test_capture
+    if defer_live_models:
+        print("\n[QONTEX] Livestream mode: AI models will load when the stream is live.")
+    else:
+        print("\n[QONTEX] Preloading AI models into VRAM... (This will pause the script until ready)")
+
+    if not args.test_chat and not defer_live_models:
         my_streamlink.preload_models(runtime_config.transcription_model)
 
-    if not args.test_capture:
+    if not args.test_capture and not defer_live_models:
         from utils import preload_classifier
 
         if runtime_config.enable_question_detector:
             preload_classifier()
-    print("[QONTEX] All models successfully loaded!\n")
+
+    if not defer_live_models:
+        print("[QONTEX] All models successfully loaded!\n")
 
     if args.test_chat:
         if not runtime_config.is_livestream:
@@ -164,11 +186,12 @@ def main():
         )
         return
 
-    try:
-        configure_agent(state, no_gemini=args.no_gemini)
-    except ValueError as e:
-        print(f"[QONTEX] CRITICAL ERROR: {e}")
-        exit(1)
+    if not runtime_config.is_livestream:
+        try:
+            configure_agent(state, no_gemini=args.no_gemini)
+        except ValueError as e:
+            print(f"[QONTEX] CRITICAL ERROR: {e}")
+            exit(1)
 
     def item_processor():
         while True:
@@ -182,26 +205,175 @@ def main():
     if not runtime_config.enable_items:
         print("[QONTEX] Item Processing is DISABLED via config.toml.")
 
+    runtime_lock = threading.RLock()
+    model_lock = threading.RLock()
+
     def current_qa_handler(config):
-        return answer_question if (state.agent and config.enable_qa) else None
+        return answer_question if config.enable_qa else None
+
+    def set_chat_stream_active(active):
+        chat_listener = state.chat_listener
+        if chat_listener and hasattr(chat_listener, "set_stream_active"):
+            chat_listener.set_stream_active(active)
+
+    def load_runtime_models(config):
+        with model_lock:
+            if config.enable_qa or config.enable_items:
+                if state.agent is None:
+                    configure_agent(state, no_gemini=args.no_gemini)
+                elif hasattr(state.agent, "refresh_from_state"):
+                    state.agent.refresh_from_state()
+            else:
+                state.agent = None
+
+            my_streamlink.preload_models(config.transcription_model)
+            if config.enable_question_detector:
+                from utils import preload_classifier
+
+                preload_classifier()
+
+    def unload_runtime_models(reason):
+        with model_lock:
+            print(f"[QONTEX] Stream is offline ({reason}). Unloading AI models from VRAM...")
+            if state.agent is not None:
+                for method_name in ("unload_models", "unload_model", "unload", "close"):
+                    unload = getattr(state.agent, method_name, None)
+                    if callable(unload):
+                        try:
+                            unload()
+                        except Exception as e:
+                            print(f"[QONTEX] [!] QA agent unload failed: {e}")
+                        break
+                state.agent = None
+
+            my_streamlink.unload_models()
+            from utils import unload_classifier
+
+            unload_classifier()
+            print("[QONTEX] AI models unloaded. Chat/EventSub listener remains active.")
+
+    def stop_capture_worker(wait=True):
+        capture_stop = state.capture_stop
+        if capture_stop:
+            capture_stop.set()
+
+        capture_process = state.capture_process
+        if capture_process and capture_process.poll() is None:
+            try:
+                capture_process.terminate()
+                capture_process.wait(timeout=5)
+            except Exception:
+                try:
+                    capture_process.kill()
+                    capture_process.wait(timeout=5)
+                except Exception:
+                    pass
+
+        capture_thread = state.capture_thread
+        if wait and capture_thread and capture_thread.is_alive() and capture_thread is not threading.current_thread():
+            capture_thread.join(timeout=10)
+
+        if not capture_thread or not capture_thread.is_alive() or capture_thread is threading.current_thread():
+            state.capture_thread = None
+            state.capture_stop = None
+            state.capture_process = None
+            return True
+
+        return False
+
+    def handle_stream_offline(reason="eventsub"):
+        if not state.config.is_livestream:
+            return
+
+        with runtime_lock:
+            capture_alive = state.capture_thread and state.capture_thread.is_alive()
+            if not state.stream_live and not capture_alive:
+                set_chat_stream_active(False)
+                return
+
+            state.stream_live = False
+            set_chat_stream_active(False)
+
+        stopped = stop_capture_worker(wait=True)
+        if not stopped:
+            print("[QONTEX] [!] Capture thread did not stop cleanly; keeping models loaded to avoid interrupting active inference.")
+            return
+        flush_json_buffer(force=True)
+        unload_runtime_models(reason)
+        print(f"[QONTEX] Waiting for {state.config.channel} to come online again...")
+
+    def start_capture_worker(config, folder, qa_handler_transcript, transcript_user):
+        capture_stop = threading.Event()
+        state.capture_stop = capture_stop
+
+        def capture_runner():
+            try:
+                result = my_streamlink.run_capture_loop(
+                    config.source,
+                    folder,
+                    process_fast=config.process_fast,
+                    question_handler=qa_handler_transcript,
+                    stop_event=capture_stop,
+                    transcript_user=transcript_user,
+                    target_fps=config.visual_context_fps,
+                    state=state,
+                )
+                if result in ("stream_ended", "unavailable") and not capture_stop.is_set():
+                    handle_stream_offline(result)
+            finally:
+                with runtime_lock:
+                    if state.capture_thread is threading.current_thread():
+                        state.capture_thread = None
+                        state.capture_stop = None
+                        state.capture_process = None
+
+        capture_thread = threading.Thread(target=capture_runner, daemon=True)
+        state.capture_thread = capture_thread
+        capture_thread.start()
+
+    def handle_stream_online(started_at=None):
+        if not state.config.is_livestream:
+            return
+
+        with runtime_lock:
+            if state.capture_thread and state.capture_thread.is_alive():
+                state.stream_live = True
+                set_chat_stream_active(True)
+                return
+
+            if started_at:
+                update_stream_start(started_at)
+
+            state.stream_live = True
+            set_chat_stream_active(True)
+            print(f"[QONTEX] {state.config.channel} is live. Loading models and starting capture...")
+
+            try:
+                load_runtime_models(state.config)
+            except ValueError as e:
+                print(f"[QONTEX] QA agent load failed: {e}")
+                state.agent = None
+            except Exception as e:
+                print(f"[QONTEX] Failed to load runtime models: {e}")
+                state.stream_live = False
+                set_chat_stream_active(False)
+                return
+
+            qa_handler = current_qa_handler(state.config)
+            qa_handler_transcript = qa_handler if state.config.enable_qa_transcript else None
+            start_capture_worker(state.config, state.log_folder, qa_handler_transcript, state.config.stream_name)
 
     def stop_runtime():
         if state.chat_listener:
             state.chat_listener.stop()
             state.chat_listener = None
 
-        if state.capture_stop:
-            state.capture_stop.set()
+        state.stream_live = False
+        stop_capture_worker(wait=True)
 
         if hasattr(state, "startup_thread") and state.startup_thread and state.startup_thread.is_alive():
             state.startup_thread.join(timeout=5)
             state.startup_thread = None
-
-        if state.capture_thread and state.capture_thread.is_alive():
-            state.capture_thread.join(timeout=5)
-
-        state.capture_thread = None
-        state.capture_stop = None
 
         flush_json_buffer(force=True)
 
@@ -214,86 +386,60 @@ def main():
         qa_handler_chat = qa_handler if config.enable_qa_chat else None
         qa_handler_transcript = qa_handler if config.enable_qa_transcript else None
 
-        capture_stop = threading.Event()
-        state.capture_stop = capture_stop
+        transcript_user = config.stream_name
 
-        def delayed_start():
-            transcript_user = config.stream_name
-            
-            if config.is_livestream:
-                from twitch_chat import wait_for_stream
-                print(f"[QONTEX] Checking if {config.channel} is live...")
-                is_live = wait_for_stream(config.channel, capture_stop)
-                if capture_stop.is_set():
-                    return
-                if not is_live:
-                    print(f"[QONTEX] Could not verify stream status for {config.channel}.")
-                    return
-
-            if config.is_livestream:
-                chat_listener = TwitchChatListener(
-                    config.twitch_username,
-                    os.getenv("TWITCH_TOKEN"),
-                    config.channel,
-                    folder,
-                    question_handler=qa_handler_chat,
-                    category_handler=update_stream_category,
-                    stream_start_handler=update_stream_start,
-                    state=state,
-                )
-                listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
-                listener_thread.start()
-                state.chat_listener = chat_listener
-                state.listener_thread = listener_thread
-                print(f"[QONTEX] Connected to {config.channel}. Listening for questions in the background...")
-            else:
-                chat_path = config.chat_path
-                if chat_path and os.path.exists(chat_path):
-                    from twitch_chat import LocalChatListener
-
-                    chat_listener = LocalChatListener(
-                        chat_path,
-                        folder,
-                        question_handler=qa_handler_chat,
-                        process_fast=config.process_fast,
-                        state=state,
-                    )
-                    login_name = chat_listener.streamer_login or chat_listener.streamer_name
-                    if login_name:
-                        transcript_user = login_name
-                        state.config = replace(state.config, stream_name=login_name)
-                        if state.agent and hasattr(state.agent, "streamer_name"):
-                            state.agent.streamer_name = login_name
-
-                    listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
-                    listener_thread.start()
-                    state.chat_listener = chat_listener
-                    state.listener_thread = listener_thread
-                    print(f"[QONTEX] VOD source '{config.source}' detected. Using chat file: {chat_path}")
-                else:
-                    state.chat_listener = None
-                    state.listener_thread = None
-                    print(f"[QONTEX] VOD source '{config.source}' detected. Offline chat is disabled. (No chat file found)")
-
-            capture_thread = threading.Thread(
-                target=my_streamlink.run_capture_loop,
-                args=(config.source, folder),
-                kwargs={
-                    "process_fast": config.process_fast,
-                    "question_handler": qa_handler_transcript,
-                    "stop_event": capture_stop,
-                    "transcript_user": transcript_user,
-                    "target_fps": config.visual_context_fps,
-                    "state": state,
-                },
-                daemon=True,
+        if config.is_livestream:
+            state.stream_live = False
+            chat_listener = TwitchChatListener(
+                config.twitch_username,
+                os.getenv("TWITCH_TOKEN"),
+                config.channel,
+                folder,
+                question_handler=qa_handler_chat,
+                category_handler=update_stream_category,
+                stream_start_handler=update_stream_start,
+                stream_online_handler=handle_stream_online,
+                stream_offline_handler=handle_stream_offline,
+                state=state,
             )
-            capture_thread.start()
-            state.capture_thread = capture_thread
+            chat_listener.set_stream_active(False)
+            listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
+            listener_thread.start()
+            state.chat_listener = chat_listener
+            state.listener_thread = listener_thread
+            state.startup_thread = None
+            print(f"[QONTEX] Connected to {config.channel} chat/EventSub. Waiting for stream status...")
+            return
 
-        startup_thread = threading.Thread(target=delayed_start, daemon=True)
-        startup_thread.start()
-        state.startup_thread = startup_thread
+        chat_path = config.chat_path
+        if chat_path and os.path.exists(chat_path):
+            from twitch_chat import LocalChatListener
+
+            chat_listener = LocalChatListener(
+                chat_path,
+                folder,
+                question_handler=qa_handler_chat,
+                process_fast=config.process_fast,
+                state=state,
+            )
+            login_name = chat_listener.streamer_login or chat_listener.streamer_name
+            if login_name:
+                transcript_user = login_name
+                state.config = replace(state.config, stream_name=login_name)
+                if state.agent and hasattr(state.agent, "streamer_name"):
+                    state.agent.streamer_name = login_name
+
+            listener_thread = threading.Thread(target=chat_listener.listen, daemon=True)
+            listener_thread.start()
+            state.chat_listener = chat_listener
+            state.listener_thread = listener_thread
+            print(f"[QONTEX] VOD source '{config.source}' detected. Using chat file: {chat_path}")
+        else:
+            state.chat_listener = None
+            state.listener_thread = None
+            print(f"[QONTEX] VOD source '{config.source}' detected. Offline chat is disabled. (No chat file found)")
+
+        start_capture_worker(config, folder, qa_handler_transcript, transcript_user)
 
     start_runtime(runtime_config, log_folder)
 
@@ -382,11 +528,13 @@ def main():
                 print(f"QA Agent: {'ACTIVE' if state.agent else 'OFFLINE'}")
                 print(f"Source: {state.config.source_kind} {state.config.source}")
                 print(f"Chat File: {state.config.chat_path or 'none'}")
-                if hasattr(state, "startup_thread") and state.startup_thread and state.startup_thread.is_alive() and not state.capture_thread:
-                    print(f"Capture: WAITING FOR STREAM")
-                    print(f"Chat Listener: WAITING FOR STREAM")
+                capture_active = state.capture_thread and state.capture_thread.is_alive()
+                if state.config.is_livestream and state.chat_listener and not capture_active and not state.stream_live:
+                    print("Capture: WAITING FOR STREAM")
+                    print("Chat Listener: ACTIVE")
+                    print("Models: UNLOADED")
                 else:
-                    print(f"Capture: {'ACTIVE' if state.capture_thread and state.capture_thread.is_alive() else 'OFFLINE'}")
+                    print(f"Capture: {'ACTIVE' if capture_active else 'OFFLINE'}")
                     print(f"Chat Listener: {'ACTIVE' if state.chat_listener else 'OFFLINE'}")
 
                 chat_listener = state.chat_listener
@@ -457,6 +605,8 @@ def main():
                     or new_config.question_detector_type != old_config.question_detector_type
                     or new_config.enable_visual_context != old_config.enable_visual_context
                     or new_config.visual_context_fps != old_config.visual_context_fps
+                    or new_config.transcription_model != old_config.transcription_model
+                    or new_config.mega_asr_path != old_config.mega_asr_path
                 )
 
                 if changed_capture:
