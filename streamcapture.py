@@ -11,6 +11,7 @@ import threading
 from collections import deque
 import torch
 from faster_whisper import WhisperModel
+from hls_program_clock import HLSProgramClock
 from utils import Message, create_stream_folder, get_config_value, get_streamer_name, is_likely_question, load_config, log_json, log_message, log_start_stop, shared_deque
 import datetime
 
@@ -348,13 +349,86 @@ def unload_models():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def start_audio_capture(source, process_fast=False, enable_video=None):
+def _hls_live_edge_segments():
+    try:
+        return max(1, int(get_config_value("HLS_LIVE_EDGE_SEGMENTS", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _is_hls_playlist_url(url):
+    return ".m3u8" in (url or "").split("?", 1)[0].lower()
+
+
+def _select_stream(streams, quality):
+    if quality == "audio_only":
+        candidates = ("audio_only", "audio", "best")
+    elif quality == "best":
+        candidates = ("best", "source", "chunked")
+    else:
+        candidates = (quality, "best")
+
+    for candidate in candidates:
+        stream = streams.get(candidate)
+        if stream is not None:
+            return stream, candidate
+
+    available = ", ".join(sorted(streams.keys())) or "none"
+    raise RuntimeError(f"Requested stream quality '{quality}' was not available. Available: {available}")
+
+
+def _stream_to_url(stream):
+    try:
+        return stream.to_url()
+    except TypeError:
+        return stream.to_manifest_url()
+
+
+def _resolve_stream_url(source, quality, live_edge_segments):
+    from streamlink import Streamlink
+    from streamlink.options import Options
+
+    session = Streamlink()
+    session.set_option("hls-live-edge", live_edge_segments)
+
+    streams = session.streams(
+        source,
+        options=Options({"low-latency": False}),
+    )
+    if not streams:
+        raise RuntimeError("No streams were returned. Is the streamer offline?")
+
+    stream, selected_quality = _select_stream(streams, quality)
+    substreams = list(getattr(stream, "substreams", None) or [])
+    if substreams:
+        video_url = _stream_to_url(substreams[0])
+        audio_url = _stream_to_url(substreams[1] if len(substreams) > 1 else substreams[0])
+    else:
+        audio_url = _stream_to_url(stream)
+        video_url = audio_url
+
+    if selected_quality != quality:
+        print(f"[QONTEX] Requested {quality}; using {selected_quality}.")
+    return audio_url, session, video_url
+
+
+def _resolve_stream_url_with_cli(source, quality):
+    return subprocess.check_output(
+        ["streamlink", "--stream-url", source, quality],
+        stderr=subprocess.STDOUT,
+    ).decode("utf-8").strip()
+
+
+def start_audio_capture(source, process_fast=False, enable_video=None, stop_event=None):
     """Starts a background process to extract audio from a video or livestream."""
     if not source.startswith("http") and "." not in source:
         source = f"https://www.twitch.tv/{source}"
 
     is_livestream = "twitch.tv" in source or source.startswith("http")
     m3u8_url = None
+    video_m3u8_url = None
+    hls_clock = None
+    streamlink_session = None
     
     command = ["ffmpeg"]
     
@@ -367,20 +441,43 @@ def start_audio_capture(source, process_fast=False, enable_video=None):
             if enable_video is None:
                 enable_video = get_config_value("ENABLE_VISUAL_CONTEXT", False)
             quality = "best" if enable_video else "audio_only"
-            m3u8_url = subprocess.check_output(
-                ["streamlink", "--stream-url", source, quality],
-                stderr=subprocess.STDOUT
-            ).decode("utf-8").strip()
-            command.extend(["-i", m3u8_url])
+            live_edge_segments = _hls_live_edge_segments()
+            try:
+                m3u8_url, streamlink_session, video_m3u8_url = _resolve_stream_url(source, quality, live_edge_segments)
+            except ModuleNotFoundError:
+                m3u8_url = _resolve_stream_url_with_cli(source, quality)
+                video_m3u8_url = m3u8_url
+
+            input_url = m3u8_url
+            if _is_hls_playlist_url(m3u8_url):
+                hls_clock = HLSProgramClock(
+                    m3u8_url,
+                    session=streamlink_session,
+                    live_edge_segments=live_edge_segments,
+                )
+                controlled_playlist = hls_clock.prime_controlled_playlist()
+                if controlled_playlist:
+                    print(f"[QONTEX] HLS program clock aligned ({hls_clock.debug_description(STREAM_START_TIME)}).")
+                    hls_clock.start(stop_event)
+                    input_url = controlled_playlist
+                    command.extend([
+                        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                        "-live_start_index", "0",
+                    ])
+                else:
+                    print("[QONTEX] HLS program timestamps were unavailable; using local capture timing.")
+                    command.extend(["-live_start_index", f"-{live_edge_segments}"])
+
+            command.extend(["-i", input_url])
         except subprocess.CalledProcessError as e:
             print(f"[QONTEX] Error resolving stream. Is the streamer offline?\nDetails: {e.output.decode('utf-8').strip()}")
-            return None, None
+            return None, None, None
         except FileNotFoundError:
-            print("[QONTEX] Error: Streamlink is not installed or not in your system PATH.")
-            return None, None
+            print("[QONTEX] Error: Streamlink or ffmpeg is not installed or not in your system PATH.")
+            return None, None, None
         except Exception as e:
             print(f"[QONTEX] Error resolving stream: {e}")
-            return None, None
+            return None, None, None
     else:
         command.extend(["-i", source])
         
@@ -394,11 +491,11 @@ def start_audio_capture(source, process_fast=False, enable_video=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL
         )
-        return process, m3u8_url
+        return process, video_m3u8_url or m3u8_url, hls_clock
         
     except FileNotFoundError:
-        print("[QONTEX] Error: Streamlink is not installed or not in your system PATH.")
-        return None, None
+        print("[QONTEX] Error: ffmpeg is not installed or not in your system PATH.")
+        return None, None, None
 
 def capture_video_frames(source_url, stop_event=None, target_fps=1.0, state=None):
     """Background thread to capture a specific number of frames per second from the video stream."""
@@ -465,7 +562,12 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
     megaASR = _import_mega_asr() if uses_mega_asr else None
     
     enable_video = state.config.enable_visual_context if state else get_config_value("ENABLE_VISUAL_CONTEXT", False)
-    audio_process, m3u8_url = start_audio_capture(source, process_fast=process_fast, enable_video=enable_video)
+    audio_process, m3u8_url, hls_clock = start_audio_capture(
+        source,
+        process_fast=process_fast,
+        enable_video=enable_video,
+        stop_event=stop_event,
+    )
     if state:
         state.capture_process = audio_process
 
@@ -496,10 +598,19 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             total_chunks = 0
             audio_start_time = None
 
+            def hls_timestamp_for_offset(audio_offset):
+                if process_fast or hls_clock is None:
+                    return None
+                return hls_clock.timestamp_for_audio_offset(audio_offset, STREAM_START_TIME)
+
             def process_transcript_segment(text, start_offset, chunk_base_time, audio_start_time_ref):
                 if not text or not text.strip():
                     return
-                if STREAM_START_TIME is None or process_fast:
+                audio_offset = chunk_base_time + start_offset
+                hls_msg_time = hls_timestamp_for_offset(audio_offset)
+                if hls_msg_time is not None:
+                    msg_time = hls_msg_time
+                elif STREAM_START_TIME is None or process_fast:
                     msg_time = chunk_base_time + start_offset
                 else:
                     segment_wall_time = audio_start_time_ref + chunk_base_time + start_offset
@@ -550,7 +661,11 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
                 total_chunks += 1
 
                 global current_video_timestamp
-                if STREAM_START_TIME is None or process_fast:
+                audio_elapsed = total_chunks * CHUNK_DURATION
+                hls_current_time = hls_timestamp_for_offset(audio_elapsed)
+                if hls_current_time is not None:
+                    current_video_timestamp = hls_current_time
+                elif STREAM_START_TIME is None or process_fast:
                     current_video_timestamp = total_chunks * CHUNK_DURATION
                 else:
                     current_video_timestamp = max(0.0, time.time() - STREAM_START_TIME)
@@ -611,6 +726,8 @@ def run_capture_loop(source, log_folder, process_fast=False, question_handler=No
             if audio_process.poll() is None:
                 audio_process.terminate()
             audio_process.wait()
+            if hls_clock is not None:
+                hls_clock.cleanup()
 
         if is_livestream and stream_ended and not (stop_event and stop_event.is_set()):
             return "stream_ended"

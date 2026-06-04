@@ -116,6 +116,16 @@ class TwitchChatListener(commands.Bot):
     def set_stream_active(self, active):
         self.stream_active = bool(active)
 
+    def set_stream_category(self, category):
+        if not category or category == self.stream_category:
+            return False
+
+        self.stream_category = category
+        if self.category_handler:
+            self.category_handler(category)
+        print(f"\rTwitch category: {category}")
+        return True
+
     def listen(self):
         asyncio.set_event_loop(self._event_loop)
         try:
@@ -156,6 +166,13 @@ class TwitchChatListener(commands.Bot):
             payload=twitchio.eventsub.StreamOfflineSubscription(broadcaster_user_id=broadcaster_id),
             as_bot=True,
         )
+        try:
+            await self.subscribe_websocket(
+                payload=twitchio.eventsub.ChannelUpdateSubscription(broadcaster_user_id=broadcaster_id),
+                as_bot=True,
+            )
+        except Exception as e:
+            print(f"[QONTEX] [!] Channel update subscription failed; category will use polling fallback: {e}")
 
         if not self._info_loop_started:
             self._info_loop_started = True
@@ -190,6 +207,7 @@ class TwitchChatListener(commands.Bot):
         self.set_stream_active(True)
         self._last_live = True
         print(f"\n[QONTEX] [*] Stream online event received for {payload.broadcaster.name}.")
+        await self.refresh_stream_category()
         if self.stream_start_handler:
             self.stream_start_handler(payload.started_at)
         if self.stream_online_handler:
@@ -202,6 +220,9 @@ class TwitchChatListener(commands.Bot):
         if self.stream_offline_handler:
             threading.Thread(target=self.stream_offline_handler, args=("eventsub",), daemon=True).start()
 
+    async def event_channel_update(self, payload):
+        self.set_stream_category(getattr(payload, "category_name", None))
+
     async def refresh_stream_info_loop(self):
         try:
             while True:
@@ -210,13 +231,14 @@ class TwitchChatListener(commands.Bot):
         except asyncio.CancelledError:
             pass
 
+    async def refresh_stream_category(self):
+        category, _started_at = await self.fetch_stream_info()
+        self.set_stream_category(category)
+        return category
+
     async def refresh_stream_info(self):
         category, started_at = await self.fetch_stream_info()
-        if category and category != self.stream_category:
-            self.stream_category = category
-            if self.category_handler:
-                self.category_handler(category)
-            print(f"\rTwitch category: {category}")
+        self.set_stream_category(category)
 
         is_live = started_at is not None
         initial_state = self._last_live is None

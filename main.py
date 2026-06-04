@@ -137,6 +137,10 @@ def main():
             state.agent.answer_question(msg)
 
     def update_stream_category(category):
+        if not category:
+            return
+        if state.config.game_name != category:
+            state.config = replace(state.config, game_name=category)
         if state.agent and hasattr(state.agent, "set_game_name"):
             state.agent.set_game_name(category)
 
